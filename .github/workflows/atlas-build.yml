@@ -136,13 +136,13 @@ jobs:
           --self-contained true
           -p:DebugSymbols=false
           -p:DebugType=none
-          --output "${{ env.APP }}/Contents/Resources/jellyfin"
+          --output "${{ env.APP }}/Contents/Resources/server"
 
       # Jellyfin serves <app folder>/jellyfin-web by default.
       - uses: actions/download-artifact@v4
         with:
           name: jellyfin-web
-          path: ${{ env.APP }}/Contents/Resources/jellyfin/jellyfin-web
+          path: ${{ env.APP }}/Contents/Resources/server/jellyfin-web
 
       - name: Bundle jellyfin-ffmpeg
         env:
@@ -167,20 +167,47 @@ jobs:
           swiftc -O -target ${{ matrix.arch }}-apple-macos13 \
             atlas/macos/main.swift \
             -o "$APP/Contents/MacOS/AtlasServer"
-          cp atlas/macos/Info.plist "$APP/Contents/Info.plist"
 
-      - name: Stamp version
+      - name: Info.plist and build stamp
         env:
           TAG: ${{ inputs.release_tag }}
         run: |
           VERSION=$(echo "${TAG:-0.0.0}" | sed -E 's/^[^0-9]*//')
           echo "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$' || VERSION=0.0.0
-          plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
-          plutil -replace CFBundleVersion -string "${{ github.run_number }}" "$APP/Contents/Info.plist"
+          # Written here instead of kept as a file, so there's nothing to get mixed up.
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>Atlas Server</string>
+              <key>CFBundleDisplayName</key>
+              <string>Atlas Server</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.besupernow.atlas.server</string>
+              <key>CFBundleExecutable</key>
+              <string>AtlasServer</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${{ github.run_number }}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>13.0</string>
+              <key>LSUIElement</key>
+              <true/>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$APP/Contents/Info.plist"
           {
             echo "tag=${TAG:-none}"
             echo "server=${GITHUB_SHA::7}"
-            echo "web=$(cat "$APP/Contents/Resources/jellyfin/jellyfin-web/WEB_COMMIT")"
+            echo "web=$(cat "$APP/Contents/Resources/server/jellyfin-web/WEB_COMMIT")"
             echo "ffmpeg=$(cat "$APP/Contents/Resources/ffmpeg/FFMPEG_ASSET")"
           } > "$APP/Contents/Resources/ATLAS_BUILD"
 
@@ -188,10 +215,15 @@ jobs:
       # Every Mach-O gets its own signature first, then the app itself.
       - name: Ad-hoc sign
         run: |
-          find "$APP/Contents/Resources" -type f -print0 | while IFS= read -r -d '' f; do
+          # Collect first, then sign: signing inside the find pipe aborts find when codesign fails.
+          machos=()
+          while IFS= read -r -d '' f; do
             if file -b "$f" | grep -q 'Mach-O'; then
-              codesign --force --sign - "$f"
+              machos+=("$f")
             fi
+          done < <(find "$APP/Contents/Resources" -type f -print0)
+          for f in "${machos[@]}"; do
+            codesign --force --sign - "$f"
           done
           codesign --force --sign - "$APP"
           codesign --verify --verbose "$APP" || echo "::warning::codesign verify reported issues"

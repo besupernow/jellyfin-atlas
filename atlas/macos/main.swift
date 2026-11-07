@@ -3,7 +3,9 @@
 //
 // Layout inside the app:
 //   Contents/MacOS/AtlasServer          this app
-//   Contents/Resources/jellyfin/        self-contained server, jellyfin-web inside
+//   Contents/Resources/server/          self-contained server, jellyfin-web inside
+//                                       (not "jellyfin/": codesign treats a folder holding a
+//                                       same-named executable as a bundle and fails on the .dlls)
 //   Contents/Resources/ffmpeg/          jellyfin-ffmpeg (ffmpeg, ffprobe)
 //
 // Data stays where the stock Jellyfin app keeps it (~/Library/Application Support/jellyfin),
@@ -81,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var resources: URL { Bundle.main.resourceURL! }
 
     private func startServer() {
-        let binary = resources.appendingPathComponent("jellyfin/jellyfin")
+        let binary = resources.appendingPathComponent("server/jellyfin")
         let ffmpeg = resources.appendingPathComponent("ffmpeg/ffmpeg")
 
         let process = Process()
