@@ -1,56 +1,104 @@
-name: Atlas build
+name: Build Atlas Server
+run-name: ${{ inputs.release_tag != '' && format('Atlas server release {0}', inputs.release_tag) || format('Atlas server build {0}', github.sha) }}
 
-# Builds a self-contained Jellyfin server with jellyfin-web bundled in,
-# for the Mac mini (osx-arm64) and Linux (linux-x64), and publishes a GitHub release.
-#
-# - Push a tag like atlas-v1.0.0: builds and makes a release named after the tag.
-# - Run workflow (Actions tab): builds and makes a pre-release tagged atlas-build-<run number>.
-#   Untick "Create a release" to only build.
-# - Push to an atlas/* branch: builds only (artifacts on the run), no release.
 on:
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: Tag for a draft release (e.g. server-1.0.0); leave empty to only produce Actions artifacts
+        default: ''
+        type: string
       web_ref:
-        description: "jellyfin-web branch or tag to bundle"
-        required: false
-        default: "master"
-      release:
-        description: "Create a release"
-        type: boolean
-        required: false
+        description: jellyfin-web branch or tag to bundle (must match the server's version line)
+        default: master
+        type: string
+      build_macos_arm64:
+        description: macOS Apple silicon (Mac mini)
         default: true
-  push:
-    branches:
-      - "atlas/**"
-    tags:
-      - "atlas-v*"
-
-permissions:
-  contents: read
+        type: boolean
+      build_macos_x64:
+        description: macOS Intel
+        default: false
+        type: boolean
+      build_linux_x64:
+        description: Linux x64
+        default: false
+        type: boolean
+      build_linux_arm64:
+        description: Linux arm64
+        default: false
+        type: boolean
+      build_windows_x64:
+        description: Windows x64
+        default: false
+        type: boolean
+      run_tests:
+        description: Run the Atlas tests before building
+        default: true
+        type: boolean
 
 env:
   SDK_VERSION: "10.0.x"
+  NODE_VERSION: "24"
 
 jobs:
-  web:
+  # Turns the checkboxes into the list of server builds.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      any: ${{ steps.plan.outputs.any }}
+    steps:
+      - id: plan
+        env:
+          MACOS_ARM64: ${{ inputs.build_macos_arm64 }}
+          MACOS_X64: ${{ inputs.build_macos_x64 }}
+          LINUX_X64: ${{ inputs.build_linux_x64 }}
+          LINUX_ARM64: ${{ inputs.build_linux_arm64 }}
+          WINDOWS_X64: ${{ inputs.build_windows_x64 }}
+        run: |
+          targets=()
+          [ "$MACOS_ARM64" = "true" ] && targets+=('{"rid":"osx-arm64","name":"macos-arm64"}')
+          [ "$MACOS_X64" = "true" ]   && targets+=('{"rid":"osx-x64","name":"macos-x64"}')
+          [ "$LINUX_X64" = "true" ]   && targets+=('{"rid":"linux-x64","name":"linux-x64"}')
+          [ "$LINUX_ARM64" = "true" ] && targets+=('{"rid":"linux-arm64","name":"linux-arm64"}')
+          [ "$WINDOWS_X64" = "true" ] && targets+=('{"rid":"win-x64","name":"windows-x64"}')
+          joined=$(IFS=,; echo "${targets[*]}")
+          echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+          [ ${#targets[@]} -gt 0 ] && echo "any=true" >> "$GITHUB_OUTPUT" || echo "any=false" >> "$GITHUB_OUTPUT"
+
+  tests:
+    if: ${{ inputs.run_tests }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+      - name: Atlas tests
+        run: dotnet test tests/Jellyfin.Api.Tests --configuration Release --filter AtlasSegmentGrid --verbosity minimal
+
+  web:
+    needs: plan
+    if: ${{ needs.plan.outputs.any == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
         with:
           repository: jellyfin/jellyfin-web
-          ref: ${{ github.event.inputs.web_ref || 'master' }}
+          ref: ${{ inputs.web_ref }}
           path: web
-
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
-
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Build jellyfin-web
         working-directory: web
         run: |
           npm ci --no-audit --no-fund
           npm run build:production
-
+          git rev-parse --short HEAD > dist/WEB_COMMIT
       - uses: actions/upload-artifact@v4
         with:
           name: jellyfin-web
@@ -58,22 +106,19 @@ jobs:
           retention-days: 1
 
   server:
-    needs: web
+    needs: [plan, tests, web]
+    if: ${{ always() && needs.plan.outputs.any == 'true' && needs.web.result == 'success' && needs.tests.result != 'failure' && needs.tests.result != 'cancelled' }}
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        rid: ["osx-arm64", "linux-x64"]
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
       fail-fast: false
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.SDK_VERSION }}
 
-      - name: Test Atlas segment math
-        run: dotnet test tests/Jellyfin.Api.Tests --configuration Release --filter AtlasSegmentGrid --verbosity minimal
-
+      # Self-contained: no .NET install needed where it runs.
       - name: Publish server
         run: >
           dotnet publish Jellyfin.Server
@@ -84,104 +129,55 @@ jobs:
           -p:DebugType=none
           --output out/jellyfin
 
+      # Jellyfin serves <app folder>/jellyfin-web by default, so no --webdir needed.
       - uses: actions/download-artifact@v4
         with:
           name: jellyfin-web
           path: out/jellyfin/jellyfin-web
 
-      # tar keeps the executable bit, a plain artifact zip doesn't.
+      - name: Stamp build
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          {
+            echo "tag=${TAG:-none}"
+            echo "server=${GITHUB_SHA::7}"
+            echo "web=$(cat out/jellyfin/jellyfin-web/WEB_COMMIT)"
+          } > out/jellyfin/ATLAS_BUILD
+
+      # tar keeps the executable bit on macOS/Linux; Windows gets a zip.
       - name: Package
         run: |
-          echo "${GITHUB_SHA::7}" > out/jellyfin/ATLAS_BUILD
-          tar -czf jellyfin-atlas-${{ matrix.rid }}.tar.gz -C out jellyfin
+          if [ "${{ matrix.rid }}" = "win-x64" ]; then
+            (cd out && zip -qr "../atlas-server-${{ matrix.name }}.zip" jellyfin)
+          else
+            tar -czf "atlas-server-${{ matrix.name }}.tar.gz" -C out jellyfin
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: jellyfin-atlas-${{ matrix.rid }}
-          path: jellyfin-atlas-${{ matrix.rid }}.tar.gz
-          retention-days: 14
+          name: atlas-server-${{ matrix.name }}
+          path: atlas-server-${{ matrix.name }}.*
 
   release:
-    needs: server
-    if: startsWith(github.ref, 'refs/tags/atlas-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true')
-    runs-on: ubuntu-latest
+    needs: [server]
+    if: ${{ always() && inputs.release_tag != '' && needs.server.result == 'success' }}
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: jellyfin-atlas-*
-          merge-multiple: true
-          path: dist
-
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum *.tar.gz > SHA256SUMS
-
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          WEB_REF: ${{ github.event.inputs.web_ref || 'master' }}
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF_NAME}"
-            FLAGS=""
-          else
-            TAG="atlas-build-${GITHUB_RUN_NUMBER}"
-            FLAGS="--prerelease --target ${GITHUB_SHA}"
-          fi
-
-          cat > notes.md <<NOTES
-          Jellyfin server with Atlas ABR, jellyfin-web bundled.
-
-          - Commit: ${GITHUB_SHA::7} on ${GITHUB_REF_NAME}
-          - jellyfin-web: ${WEB_REF}
-
-          Mac mini: download jellyfin-atlas-osx-arm64.tar.gz, then
-          \`tar -xzf jellyfin-atlas-osx-arm64.tar.gz && xattr -dr com.apple.quarantine jellyfin\`
-          NOTES
-
-          gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Atlas $TAG" \
-            --notes-file notes.md \
-            $FLAGS
-
-  release:
-    if: github.event_name == 'workflow_dispatch'
-    needs: server
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
+          path: artifacts
+          pattern: atlas-server-*
+      - run: ls -R artifacts
+      - uses: softprops/action-gh-release@v2
         with:
-          pattern: jellyfin-atlas-*
-          merge-multiple: true
-          path: dist
-
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.inputs.tag }}
-          PRERELEASE: ${{ github.event.inputs.prerelease }}
-          WEB_REF: ${{ github.event.inputs.web_ref || 'master' }}
-        run: |
-          cd dist
-          sha256sum *.tar.gz > SHA256SUMS.txt
-
-          notes="Atlas build of ${GITHUB_SHA::7} (${GITHUB_REF_NAME}), jellyfin-web ${WEB_REF}."
-
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            # Re-running with the same tag replaces the files on the existing release.
-            gh release upload "$TAG" *.tar.gz SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            flags=()
-            if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
-            gh release create "$TAG" *.tar.gz SHA256SUMS.txt \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "Jellyfin Atlas $TAG" \
-              --notes "$notes" \
-              "${flags[@]}"
-          fi
+          files: artifacts/**/*
+          draft: true
+          name: Atlas Server ${{ inputs.release_tag }}
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Jellyfin server with Atlas ABR, jellyfin-web `${{ inputs.web_ref }}` bundled.
+            macOS: `xattr -dr com.apple.quarantine jellyfin` after extracting, then run `./jellyfin/jellyfin --ffmpeg <path to jellyfin-ffmpeg>`.
