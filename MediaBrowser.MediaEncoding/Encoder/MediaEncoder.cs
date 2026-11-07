@@ -172,9 +172,19 @@ namespace MediaBrowser.MediaEncoding.Encoder
         private static partial Regex FfprobePathRegex();
 
         /// <summary>
+        /// Gets the path of the ffmpeg bundled with an Atlas build, if there is one.
+        /// </summary>
+        /// <returns>The path, or <c>null</c> if no ffmpeg is bundled.</returns>
+        private static string GetBundledFFmpegPath()
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "ffmpeg", OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg");
+            return File.Exists(path) ? path : null;
+        }
+
+        /// <summary>
         /// Run at startup to validate ffmpeg.
         /// Sets global variables FFmpegPath.
-        /// Precedence is: CLI/Env var > Config > $PATH.
+        /// Precedence is: CLI/Env var > Config > bundled (Atlas) > $PATH.
         /// </summary>
         /// <returns>bool indicates whether a valid ffmpeg is found.</returns>
         public bool SetFFmpegPath()
@@ -194,6 +204,13 @@ namespace MediaBrowser.MediaEncoding.Encoder
                 // 2) Custom path stored in config/encoding xml file under tag <EncoderAppPath> should be used as a fallback
                 ffmpegPath = _configurationManager.GetEncodingOptions().EncoderAppPath;
                 ffmpegPathSetMethodText = "encoding.xml config file";
+                if (string.IsNullOrEmpty(ffmpegPath))
+                {
+                    // Atlas: the jellyfin-ffmpeg bundled with the build, in <app folder>/ffmpeg.
+                    ffmpegPath = GetBundledFFmpegPath();
+                    ffmpegPathSetMethodText = "bundled ffmpeg";
+                }
+
                 if (string.IsNullOrEmpty(ffmpegPath))
                 {
                     // 3) Check "ffmpeg"

@@ -69,6 +69,23 @@ public class StreamState : EncodingJobInfo, IDisposable
     public bool IsOutputVideo => Request is VideoRequestDto;
 
     /// <summary>
+    /// Gets or sets the Atlas ABR quality level this request belongs to, or <c>null</c> outside Atlas ABR.
+    /// Each level gets its own transcode folder and ffmpeg job (see <see cref="AtlasAbrSettings"/>).
+    /// </summary>
+    public string? AtlasLevel { get; set; }
+
+    /// <summary>
+    /// Gets a value indicating whether the request belongs to an Atlas ABR quality level.
+    /// </summary>
+    public bool IsAtlasLevel => !string.IsNullOrEmpty(AtlasLevel);
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the Atlas ABR segment boundaries are the original file's
+    /// keyframes (<c>true</c>) or computed from the frame rate (<c>false</c>).
+    /// </summary>
+    public bool AtlasKeyframeSegments { get; set; }
+
+    /// <summary>
     /// Gets the segment length.
     /// </summary>
     public int SegmentLength

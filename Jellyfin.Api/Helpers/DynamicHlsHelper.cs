@@ -26,6 +26,7 @@ using MediaBrowser.Model.Net;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 using Microsoft.Net.Http.Headers;
 
 namespace Jellyfin.Api.Helpers;
@@ -207,6 +208,21 @@ public class DynamicHlsHelper
         if (!string.IsNullOrWhiteSpace(subtitleGroup))
         {
             AddSubtitles(state, subtitleStreams, builder, _httpContextAccessor.HttpContext.User);
+        }
+
+        // Atlas ABR: a real quality ladder for clients that ask for it. Stock clients never get here.
+        if (IsAtlasAbrRequest(state, isLiveStream))
+        {
+            AppendAtlasLadder(builder, state, playlistQuery, baseUrl, subtitleGroup);
+
+            if (state.VideoRequest?.EnableTrickplay ?? false)
+            {
+                var atlasSourceId = Guid.Parse(state.Request.MediaSourceId);
+                var atlasTrickplayResolutions = await _trickplayManager.GetTrickplayResolutions(atlasSourceId).ConfigureAwait(false);
+                AddTrickplay(state, atlasTrickplayResolutions, builder, _httpContextAccessor.HttpContext.User);
+            }
+
+            return new FileContentResult(Encoding.UTF8.GetBytes(builder.ToString()), MimeTypes.GetMimeType("playlist.m3u8"));
         }
 
         // For DoVi profiles without a compatible base layer (P5 HEVC, P10/bl0 AV1),
@@ -634,6 +650,198 @@ public class DynamicHlsHelper
                 .Append(framerate.Value.ToString(CultureInfo.InvariantCulture));
         }
     }
+
+    private bool IsAtlasAbrRequest(StreamState state, bool isLiveStream)
+    {
+        if (!AtlasAbrSettings.Enabled || isLiveStream)
+        {
+            return false;
+        }
+
+        var requested = _httpContextAccessor.HttpContext?.Request.Query[AtlasAbrSettings.RequestParameter].ToString();
+        return bool.TryParse(requested, out var isRequested)
+            && isRequested
+            && state.IsOutputVideo
+            && state.VideoRequest is not null
+            && state.VideoStream is not null
+            && (state.VideoStream.Width ?? 0) > 0
+            && (state.VideoStream.Height ?? 0) > 0
+            && (state.RunTimeTicks ?? 0) > 0
+            && !string.IsNullOrEmpty(state.MediaPath)
+            && !string.IsNullOrEmpty(state.Request.MediaSourceId);
+    }
+
+    /// <summary>
+    /// Appends the Atlas ABR ladder: transcoded levels below the source, and the original file on top
+    /// (stream copy) when it has been analyzed and is keyframe aligned, otherwise a full resolution transcode.
+    /// </summary>
+    /// <param name="builder">StringBuilder for the master playlist.</param>
+    /// <param name="state">StreamState of the master request.</param>
+    /// <param name="playlistQuery">The query the variant URLs are built from.</param>
+    /// <param name="baseUrl">The variant playlist URL.</param>
+    /// <param name="subtitleGroup">Subtitle group identifier, or null.</param>
+    private void AppendAtlasLadder(StringBuilder builder, StreamState state, Dictionary<string, StringValues> playlistQuery, string baseUrl, string? subtitleGroup)
+    {
+        var videoStream = state.VideoStream!;
+        var grid = AtlasAbrSettings.GridSeconds;
+        var info = AtlasSourceAnalyzer.GetOrQueue(
+            state.Request.MediaSourceId!,
+            state.MediaPath,
+            _mediaEncoder.ProbePath,
+            GetAtlasCacheDirectory(),
+            grid,
+            _logger);
+
+        // The original can only sit next to transcodes if its keyframes are on the same grid, and only
+        // if the client can play it as is (the master request resolved to a video stream copy).
+        var includeOriginal = EncodingHelper.IsCopyCodec(state.OutputVideoCodec) && info is { Aligned: true };
+        var segments = includeOriginal ? AtlasAbrSettings.KeyframeSegments : AtlasAbrSettings.GridSegments;
+        long sourceBitrate = info is { AverageVideoBitrate: > 0 } ? info.AverageVideoBitrate : videoStream.BitRate ?? 0;
+        var levels = AtlasAbrLadder.Build(videoStream.Width ?? 0, videoStream.Height ?? 0, sourceBitrate, includeOriginal);
+        if (levels.Count == 0)
+        {
+            return;
+        }
+
+        var audioBitrate = string.IsNullOrEmpty(state.ActualOutputAudioCodec)
+            ? 0
+            : state.OutputAudioBitrate ?? state.AudioStream?.BitRate ?? 192_000;
+
+        // Small allowance for container and segment overhead on top of the elementary streams.
+        const double Overhead = 1.05;
+
+        var variants = new List<(long Peak, string Text)>(levels.Count);
+        foreach (var level in levels)
+        {
+            var query = new Dictionary<string, StringValues>(playlistQuery, StringComparer.OrdinalIgnoreCase);
+            query.Remove(AtlasAbrSettings.RequestParameter);
+            query.Remove(AtlasAbrSettings.StartBitrateParameter);
+            query[AtlasAbrSettings.LevelParameter] = level.Id;
+            query[AtlasAbrSettings.SegmentsParameter] = segments;
+            query["SegmentLength"] = grid.ToString(CultureInfo.InvariantCulture);
+
+            long peak;
+            long average;
+            var line = new StringBuilder();
+            if (level.IsOriginal)
+            {
+                var peakVideo = info is { PeakVideoBitrate: > 0 }
+                    ? info.PeakVideoBitrate
+                    : (long)(sourceBitrate * AtlasAbrSettings.FallbackPeakFactor);
+                peak = (long)((peakVideo + audioBitrate) * Overhead);
+                average = (long)((sourceBitrate + audioBitrate) * Overhead);
+
+                line.Append("#EXT-X-STREAM-INF:BANDWIDTH=").Append(peak.ToString(CultureInfo.InvariantCulture))
+                    .Append(",AVERAGE-BANDWIDTH=").Append(average.ToString(CultureInfo.InvariantCulture));
+                AppendPlaylistVideoRangeField(line, state);
+                AppendPlaylistCodecsField(line, state);
+                AppendPlaylistResolutionField(line, state);
+            }
+            else
+            {
+                query["VideoCodec"] = "h264";
+                query["AllowVideoStreamCopy"] = "false";
+                query["VideoBitrate"] = level.VideoBitrate.ToString(CultureInfo.InvariantCulture);
+                query["MaxWidth"] = level.Width.ToString(CultureInfo.InvariantCulture);
+                query["MaxHeight"] = level.Height.ToString(CultureInfo.InvariantCulture);
+                query["h264-profile"] = "high";
+                query["h264-level"] = "41";
+                query.Remove("Width");
+                query.Remove("Height");
+
+                // A capped transcode can still burst above its target within one short segment.
+                peak = (long)(((level.VideoBitrate * 1.4) + audioBitrate) * Overhead);
+                average = (long)((level.VideoBitrate + audioBitrate) * Overhead);
+
+                line.Append("#EXT-X-STREAM-INF:BANDWIDTH=").Append(peak.ToString(CultureInfo.InvariantCulture))
+                    .Append(",AVERAGE-BANDWIDTH=").Append(average.ToString(CultureInfo.InvariantCulture))
+                    .Append(",VIDEO-RANGE=SDR")
+                    .Append(",CODECS=\"avc1.640029");
+                if (!string.IsNullOrEmpty(state.ActualOutputAudioCodec))
+                {
+                    var audioCodecs = GetPlaylistAudioCodecs(state);
+                    if (!string.IsNullOrEmpty(audioCodecs))
+                    {
+                        line.Append(',').Append(audioCodecs);
+                    }
+                }
+
+                line.Append('"')
+                    .Append(",RESOLUTION=").Append(level.Width.ToString(CultureInfo.InvariantCulture))
+                    .Append('x').Append(level.Height.ToString(CultureInfo.InvariantCulture));
+            }
+
+            AppendPlaylistFramerateField(line, state);
+            if (!string.IsNullOrWhiteSpace(subtitleGroup))
+            {
+                line.Append(",SUBTITLES=\"").Append(subtitleGroup).Append('"');
+            }
+
+            line.AppendLine();
+            line.AppendLine(Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, query));
+            variants.Add((peak, line.ToString()));
+        }
+
+        // AVPlayer starts on the first variant listed, so the level that fits the client's expected
+        // bandwidth goes first. Without a hint, start around 720p.
+        var startIndex = GetAtlasStartIndex(variants, levels);
+        builder.Insert(GetFirstLineEnd(builder), "#EXT-X-INDEPENDENT-SEGMENTS" + Environment.NewLine);
+        builder.Append(variants[startIndex].Text);
+        for (var i = 0; i < variants.Count; i++)
+        {
+            if (i != startIndex)
+            {
+                builder.Append(variants[i].Text);
+            }
+        }
+    }
+
+    private int GetAtlasStartIndex(List<(long Peak, string Text)> variants, IReadOnlyList<AtlasAbrLevel> levels)
+    {
+        var hint = _httpContextAccessor.HttpContext?.Request.Query[AtlasAbrSettings.StartBitrateParameter].ToString();
+        if (long.TryParse(hint, NumberStyles.Integer, CultureInfo.InvariantCulture, out var startBitrate) && startBitrate > 0)
+        {
+            // Leave headroom: a level that needs all of the measured bandwidth will stall.
+            var budget = startBitrate * 0.8;
+            var best = 0;
+            for (var i = 0; i < variants.Count; i++)
+            {
+                if (variants[i].Peak <= budget)
+                {
+                    best = i;
+                }
+            }
+
+            return best;
+        }
+
+        var start = 0;
+        for (var i = 0; i < levels.Count; i++)
+        {
+            if (levels[i].Height <= 720)
+            {
+                start = i;
+            }
+        }
+
+        return start;
+    }
+
+    private static int GetFirstLineEnd(StringBuilder builder)
+    {
+        for (var i = 0; i < builder.Length; i++)
+        {
+            if (builder[i] == '\n')
+            {
+                return i + 1;
+            }
+        }
+
+        return builder.Length;
+    }
+
+    private string GetAtlasCacheDirectory()
+        => System.IO.Path.Combine(_serverConfigurationManager.ApplicationPaths.CachePath, "atlas-abr");
 
     private bool EnableAdaptiveBitrateStreaming(StreamState state, bool isLiveStream, bool enableAdaptiveBitrateStreaming, IPAddress ipAddress)
     {

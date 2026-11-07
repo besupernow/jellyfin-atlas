@@ -40,6 +40,11 @@ namespace Jellyfin.Api.Controllers;
 [ApiExplorerSettings(IgnoreApi = true)]
 public class DynamicHlsController : BaseJellyfinApiController
 {
+    /// <summary>
+    /// Constant shift applied to every Atlas ABR level's timestamps, so none can go negative.
+    /// </summary>
+    private const int AtlasTimestampOffsetSeconds = 10;
+
     private const EncoderPreset DefaultVodEncoderPreset = EncoderPreset.veryfast;
     private const EncoderPreset DefaultEventEncoderPreset = EncoderPreset.superfast;
     private const TranscodingJobType TranscodingJobType = MediaBrowser.Controller.MediaEncoding.TranscodingJobType.Hls;
@@ -1418,7 +1423,11 @@ public class DynamicHlsController : BaseJellyfinApiController
             state.Request.SegmentContainer ?? string.Empty,
             "hls1/main/",
             Request.QueryString.ToString(),
-            EncodingHelper.IsCopyCodec(state.OutputVideoCodec));
+            EncodingHelper.IsCopyCodec(state.OutputVideoCodec))
+        {
+            // Atlas ABR: every quality level lists the same boundaries, so players can switch at any segment.
+            SegmentLengths = state.IsAtlasLevel ? GetAtlasSegmentLengths(state) : null
+        };
         var playlist = _dynamicHlsPlaylistGenerator.CreateMainPlaylist(request);
 
         return new FileContentResult(Encoding.UTF8.GetBytes(playlist), MimeTypes.GetMimeType("playlist.m3u8"));
@@ -1501,8 +1510,21 @@ public class DynamicHlsController : BaseJellyfinApiController
                     var currentJob = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
                     await WaitForActiveTranscodingRequests(currentJob, cancellationToken).ConfigureAwait(false);
 
-                    await _transcodeManager.KillTranscodingJobs(streamingRequest.DeviceId, streamingRequest.PlaySessionId, p => false)
-                        .ConfigureAwait(false);
+                    if (state.IsAtlasLevel)
+                    {
+                        // Atlas ABR: only replace this level's own job. The session's other levels keep
+                        // running, so the player can keep playing the level it's leaving until this one
+                        // has a segment ready. Levels nobody fetches anymore are stopped once they go idle.
+                        await _transcodeManager.KillTranscodingJobs(
+                                j => j.Type == TranscodingJobType && string.Equals(j.Path, playlistPath, StringComparison.OrdinalIgnoreCase),
+                                p => false)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await _transcodeManager.KillTranscodingJobs(streamingRequest.DeviceId, streamingRequest.PlaySessionId, p => false)
+                            .ConfigureAwait(false);
+                    }
 
                     if (currentTranscodingIndex.HasValue)
                     {
@@ -1647,7 +1669,7 @@ public class DynamicHlsController : BaseJellyfinApiController
             GetVideoArguments(state, startNumber, isEventPlaylist, segmentContainer),
             GetAudioArguments(state),
             maxMuxingQueueSize,
-            state.SegmentLength.ToString(CultureInfo.InvariantCulture),
+            GetHlsTime(state),
             segmentFormat,
             startNumber.ToString(CultureInfo.InvariantCulture),
             baseUrlParam,
@@ -1869,7 +1891,9 @@ public class DynamicHlsController : BaseJellyfinApiController
             args += _encodingHelper.GetVideoQualityParam(state, codec, _encodingOptions, isEventPlaylist ? DefaultEventEncoderPreset : DefaultVodEncoderPreset);
 
             // Set the key frame params for video encoding to match the hls segment time.
-            args += _encodingHelper.GetHlsVideoKeyFrameArguments(state, codec, state.SegmentLength, isEventPlaylist, startNumber);
+            args += state.IsAtlasLevel
+                ? GetAtlasKeyFrameArguments(state, codec, startNumber)
+                : _encodingHelper.GetHlsVideoKeyFrameArguments(state, codec, state.SegmentLength, isEventPlaylist, startNumber);
 
             // Currently b-frames in libx265 breaks the FMP4-HLS playback on iOS, disable it for now.
             if (string.Equals(codec, "libx265", StringComparison.OrdinalIgnoreCase)
@@ -1895,6 +1919,12 @@ public class DynamicHlsController : BaseJellyfinApiController
                     args += " -start_at_zero";
                 }
             }
+            else if (state.IsAtlasLevel)
+            {
+                // Atlas ABR: same timeline as the stream copy level (which always uses -start_at_zero),
+                // so segments of different levels carry the same timestamps.
+                args += " -start_at_zero";
+            }
         }
 
         // TODO why was this not enabled for VOD?
@@ -1910,7 +1940,98 @@ public class DynamicHlsController : BaseJellyfinApiController
 
         args += _encodingHelper.GetOutputFFlags(state);
 
+        if (state.IsAtlasLevel)
+        {
+            // Atlas ABR: -copyts keeps the source's own timestamps, and a copied AAC track
+            // (encoder priming) or B-frame decode order can start slightly below zero. fMP4
+            // can't carry that: tfdt is unsigned, and ExoPlayer refuses the segment ("Top bit
+            // not zero"). Every level gets the same constant shift, so they stay aligned.
+            args += " -output_ts_offset " + AtlasTimestampOffsetSeconds.ToString(CultureInfo.InvariantCulture);
+        }
+
         return args;
+    }
+
+    /// <summary>
+    /// Gets the segment lengths every level of an Atlas ABR playback lists.
+    /// </summary>
+    /// <param name="state">The <see cref="StreamState"/> of an Atlas ABR level.</param>
+    /// <returns>The segment lengths in seconds, or <c>null</c> to fall back to Jellyfin's own.</returns>
+    private IReadOnlyList<double>? GetAtlasSegmentLengths(StreamState state)
+    {
+        var runtimeTicks = state.RunTimeTicks ?? 0;
+        if (runtimeTicks <= 0 || state.SegmentLength <= 0)
+        {
+            return null;
+        }
+
+        if (state.AtlasKeyframeSegments && !string.IsNullOrEmpty(state.Request.MediaSourceId))
+        {
+            var info = AtlasSourceAnalyzer.TryGetCached(
+                state.Request.MediaSourceId,
+                state.MediaPath,
+                Path.Combine(_serverConfigurationManager.ApplicationPaths.CachePath, "atlas-abr"),
+                state.SegmentLength);
+            if (info is { Aligned: true, KeyframeSeconds.Count: > 0 })
+            {
+                return AtlasSegmentGrid.FromKeyframes(info.KeyframeSeconds, runtimeTicks);
+            }
+
+            _logger.LogWarning("Atlas ABR: no keyframe analysis for {Path}, using grid segments", state.MediaPath);
+        }
+
+        return AtlasSegmentGrid.FromGrid(runtimeTicks, state.SegmentLength, AtlasSegmentGrid.GetFrameRate(state.VideoStream));
+    }
+
+    /// <summary>
+    /// Gets the keyframe arguments of a transcoded Atlas ABR level: a keyframe on every grid point of
+    /// the source timeline and nowhere else, so its segments line up with every other level's.
+    /// </summary>
+    /// <param name="state">The <see cref="StreamState"/>.</param>
+    /// <param name="codec">The video encoder.</param>
+    /// <param name="startNumber">The segment the transcode starts at.</param>
+    /// <returns>The command line arguments.</returns>
+    private static string GetAtlasKeyFrameArguments(StreamState state, string codec, int startNumber)
+    {
+        var grid = state.SegmentLength;
+        var fps = AtlasSegmentGrid.GetFrameRate(state.VideoStream);
+        var offset = AtlasSegmentGrid.KeyframeOffset(state.BaseRequest.StartTimeTicks ?? 0, startNumber, grid, fps, state.AtlasKeyframeSegments);
+
+        // t counts from the first encoded frame; the offset moves the forced keyframes back onto the global grid.
+        var args = string.Format(
+            CultureInfo.InvariantCulture,
+            " -force_key_frames:0 \"expr:gte(t,n_forced*{0}-{1})\"",
+            grid,
+            offset.ToString("0.######", CultureInfo.InvariantCulture));
+
+        if (fps > 0)
+        {
+            // No keyframes between grid points (scene cuts or a short GOP would add segment cuts).
+            var gop = (int)Math.Ceiling(grid * fps);
+            args += string.Format(CultureInfo.InvariantCulture, " -g:v:0 {0} -keyint_min:v:0 {0}", gop);
+        }
+
+        if (string.Equals(codec, "libx264", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(codec, "libx265", StringComparison.OrdinalIgnoreCase))
+        {
+            args += " -sc_threshold:v:0 0";
+        }
+
+        return args;
+    }
+
+    /// <summary>
+    /// Gets the -hls_time value. Atlas ABR levels use half the segment length, so ffmpeg cuts a segment
+    /// at every keyframe; the keyframes themselves are placed (or verified, for the original) on the grid.
+    /// Cutting by elapsed time instead would drift off the grid after a transcode restarts mid-file.
+    /// </summary>
+    /// <param name="state">The <see cref="StreamState"/>.</param>
+    /// <returns>The -hls_time value.</returns>
+    private static string GetHlsTime(StreamState state)
+    {
+        return state.IsAtlasLevel
+            ? (state.SegmentLength / 2.0).ToString("0.###", CultureInfo.InvariantCulture)
+            : state.SegmentLength.ToString(CultureInfo.InvariantCulture);
     }
 
     private string GetSegmentPath(StreamState state, string playlist, int index)
@@ -2008,6 +2129,12 @@ public class DynamicHlsController : BaseJellyfinApiController
                 transcodingJob.DownloadPositionTicks = Math.Max(transcodingJob.DownloadPositionTicks ?? segmentEndingPositionTicks, segmentEndingPositionTicks);
                 transcodingJob.ReportSegmentDownloaded(segmentIndex, segmentEndingPositionTicks);
                 _transcodeManager.OnTranscodeEndRequest(transcodingJob);
+
+                // Atlas ABR: this level is the one being watched; stop levels the player has left.
+                if (state.IsAtlasLevel)
+                {
+                    return _transcodeManager.OnAtlasLevelSegmentServed(transcodingJob);
+                }
             }
 
             return Task.CompletedTask;

@@ -159,6 +159,17 @@ public sealed class TranscodingJob : IDisposable
     public int PingTimeout { get; set; }
 
     /// <summary>
+    /// Gets or sets the Atlas ABR quality level this job produces, or <c>null</c> for a regular job.
+    /// </summary>
+    public string? AtlasLevel { get; set; }
+
+    /// <summary>
+    /// Gets or sets when a segment of this job's Atlas ABR level was last requested (UTC).
+    /// Levels that go quiet are stopped instead of being kept alive by the session's progress pings.
+    /// </summary>
+    public DateTime AtlasLastActivityUtc { get; set; }
+
+    /// <summary>
     /// Records the end position of a served segment.
     /// </summary>
     /// <param name="segmentIndex">The segment index.</param>

@@ -1,0 +1,350 @@
+name: Build Atlas Server
+run-name: ${{ inputs.release_tag != '' && format('Atlas server release {0}', inputs.release_tag) || format('Atlas server build {0}', github.sha) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag for a draft release (e.g. server-1.0.0); leave empty to only produce Actions artifacts
+        default: ''
+        type: string
+      web_ref:
+        description: jellyfin-web branch or tag to bundle (must match the server's version line)
+        default: master
+        type: string
+      ffmpeg_tag:
+        description: jellyfin-ffmpeg release tag to bundle (e.g. v7.1.2-4); leave empty for the latest
+        default: ''
+        type: string
+      build_macos_arm64:
+        description: macOS Apple silicon .dmg (Mac mini)
+        default: true
+        type: boolean
+      build_macos_x64:
+        description: macOS Intel .dmg
+        default: false
+        type: boolean
+      build_linux_x64:
+        description: Linux x64
+        default: false
+        type: boolean
+      build_linux_arm64:
+        description: Linux arm64
+        default: false
+        type: boolean
+      build_windows_x64:
+        description: Windows x64
+        default: false
+        type: boolean
+      run_tests:
+        description: Run the Atlas tests before building
+        default: true
+        type: boolean
+
+env:
+  SDK_VERSION: "10.0.x"
+  NODE_VERSION: "24"
+
+jobs:
+  # Turns the checkboxes into build lists. macOS builds on a Mac (the app has to be compiled and
+  # signed there), everything else on Linux. "ffmpeg" is the jellyfin-ffmpeg portable asset to bundle.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      mac: ${{ steps.plan.outputs.mac }}
+      other: ${{ steps.plan.outputs.other }}
+      any_mac: ${{ steps.plan.outputs.any_mac }}
+      any_other: ${{ steps.plan.outputs.any_other }}
+    steps:
+      - id: plan
+        env:
+          MACOS_ARM64: ${{ inputs.build_macos_arm64 }}
+          MACOS_X64: ${{ inputs.build_macos_x64 }}
+          LINUX_X64: ${{ inputs.build_linux_x64 }}
+          LINUX_ARM64: ${{ inputs.build_linux_arm64 }}
+          WINDOWS_X64: ${{ inputs.build_windows_x64 }}
+        run: |
+          mac=(); other=()
+          [ "$MACOS_ARM64" = "true" ] && mac+=('{"rid":"osx-arm64","name":"macos-arm64","arch":"arm64","ffmpeg":"*_portable_macarm64*gpl*.tar.xz"}')
+          [ "$MACOS_X64" = "true" ]   && mac+=('{"rid":"osx-x64","name":"macos-x64","arch":"x86_64","ffmpeg":"*_portable_mac64*gpl*.tar.xz"}')
+          [ "$LINUX_X64" = "true" ]   && other+=('{"rid":"linux-x64","name":"linux-x64","ffmpeg":"*_portable_linux64*gpl*.tar.xz"}')
+          [ "$LINUX_ARM64" = "true" ] && other+=('{"rid":"linux-arm64","name":"linux-arm64","ffmpeg":"*_portable_linuxarm64*gpl*.tar.xz"}')
+          [ "$WINDOWS_X64" = "true" ] && other+=('{"rid":"win-x64","name":"windows-x64","ffmpeg":"*_portable_win64*gpl*.zip"}')
+          echo "mac={\"include\":[$(IFS=,; echo "${mac[*]}")]}" >> "$GITHUB_OUTPUT"
+          echo "other={\"include\":[$(IFS=,; echo "${other[*]}")]}" >> "$GITHUB_OUTPUT"
+          echo "any_mac=$([ ${#mac[@]} -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "any_other=$([ ${#other[@]} -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  tests:
+    if: ${{ inputs.run_tests }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+      - name: Atlas tests
+        run: dotnet test tests/Jellyfin.Api.Tests --configuration Release --filter AtlasSegmentGrid --verbosity minimal
+
+  web:
+    needs: plan
+    if: ${{ needs.plan.outputs.any_mac == 'true' || needs.plan.outputs.any_other == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jellyfin/jellyfin-web
+          ref: ${{ inputs.web_ref }}
+          path: web
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build jellyfin-web
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:production
+          git rev-parse --short HEAD > dist/WEB_COMMIT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jellyfin-web
+          path: web/dist
+          retention-days: 1
+
+  macos:
+    needs: [plan, tests, web]
+    if: ${{ always() && needs.plan.outputs.any_mac == 'true' && needs.web.result == 'success' && needs.tests.result != 'failure' && needs.tests.result != 'cancelled' }}
+    runs-on: macos-15
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.mac) }}
+      fail-fast: false
+    env:
+      APP: out/Atlas Server.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Publish server
+        run: >
+          dotnet publish Jellyfin.Server
+          --configuration Release
+          --runtime ${{ matrix.rid }}
+          --self-contained true
+          -p:DebugSymbols=false
+          -p:DebugType=none
+          --output "${{ env.APP }}/Contents/Resources/server"
+
+      # Jellyfin serves <app folder>/jellyfin-web by default.
+      - uses: actions/download-artifact@v4
+        with:
+          name: jellyfin-web
+          path: ${{ env.APP }}/Contents/Resources/server/jellyfin-web
+
+      - name: Bundle jellyfin-ffmpeg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FFMPEG_TAG: ${{ inputs.ffmpeg_tag }}
+          PATTERN: ${{ matrix.ffmpeg }}
+          DEST: ${{ env.APP }}/Contents/Resources/ffmpeg
+        run: |
+          gh release download $FFMPEG_TAG --repo jellyfin/jellyfin-ffmpeg --pattern "$PATTERN" --dir ffdl \
+            || { echo "No asset matched $PATTERN. Assets:"; gh release view $FFMPEG_TAG --repo jellyfin/jellyfin-ffmpeg --json assets -q '.assets[].name'; exit 1; }
+          ls ffdl
+          mkdir -p ffx "$DEST"
+          tar -xJf ffdl/* -C ffx
+          cp "$(find ffx -type f -name ffmpeg | head -1)" "$DEST/ffmpeg"
+          cp "$(find ffx -type f -name ffprobe | head -1)" "$DEST/ffprobe"
+          chmod +x "$DEST/ffmpeg" "$DEST/ffprobe"
+          basename ffdl/* > "$DEST/FFMPEG_ASSET"
+
+      - name: Build menu bar app
+        run: |
+          mkdir -p "$APP/Contents/MacOS"
+          swiftc -O -target ${{ matrix.arch }}-apple-macos13 \
+            atlas/macos/main.swift \
+            -o "$APP/Contents/MacOS/AtlasServer"
+
+      - name: Info.plist and build stamp
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          VERSION=$(echo "${TAG:-0.0.0}" | sed -E 's/^[^0-9]*//')
+          echo "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$' || VERSION=0.0.0
+          # Written here instead of kept as a file, so there's nothing to get mixed up.
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>Atlas Server</string>
+              <key>CFBundleDisplayName</key>
+              <string>Atlas Server</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.besupernow.atlas.server</string>
+              <key>CFBundleExecutable</key>
+              <string>AtlasServer</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${{ github.run_number }}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>13.0</string>
+              <key>LSUIElement</key>
+              <true/>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$APP/Contents/Info.plist"
+          {
+            echo "tag=${TAG:-none}"
+            echo "server=${GITHUB_SHA::7}"
+            echo "web=$(cat "$APP/Contents/Resources/server/jellyfin-web/WEB_COMMIT")"
+            echo "ffmpeg=$(cat "$APP/Contents/Resources/ffmpeg/FFMPEG_ASSET")"
+          } > "$APP/Contents/Resources/ATLAS_BUILD"
+
+      # No Apple Developer ID, so ad-hoc sign: Apple silicon won't run unsigned code at all.
+      # Every Mach-O gets its own signature first, then the app itself.
+      - name: Ad-hoc sign
+        run: |
+          # Collect first, then sign: signing inside the find pipe aborts find when codesign fails.
+          machos=()
+          while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q 'Mach-O'; then
+              machos+=("$f")
+            fi
+          done < <(find "$APP/Contents/Resources" -type f -print0)
+          for f in "${machos[@]}"; do
+            codesign --force --sign - "$f"
+          done
+          codesign --force --sign - "$APP"
+          codesign --verify --verbose "$APP" || echo "::warning::codesign verify reported issues"
+
+      - name: Make DMG
+        run: |
+          mkdir dmg
+          cp -R "$APP" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Atlas Server" -srcfolder dmg -ov -format UDZO "atlas-server-${{ matrix.name }}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atlas-server-${{ matrix.name }}
+          path: atlas-server-${{ matrix.name }}.dmg
+
+  server:
+    needs: [plan, tests, web]
+    if: ${{ always() && needs.plan.outputs.any_other == 'true' && needs.web.result == 'success' && needs.tests.result != 'failure' && needs.tests.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.other) }}
+      fail-fast: false
+    env:
+      ROOT: out/atlas-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Publish server
+        run: >
+          dotnet publish Jellyfin.Server
+          --configuration Release
+          --runtime ${{ matrix.rid }}
+          --self-contained true
+          -p:DebugSymbols=false
+          -p:DebugType=none
+          --output "${{ env.ROOT }}/jellyfin"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jellyfin-web
+          path: ${{ env.ROOT }}/jellyfin/jellyfin-web
+
+      - name: Bundle jellyfin-ffmpeg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FFMPEG_TAG: ${{ inputs.ffmpeg_tag }}
+          PATTERN: ${{ matrix.ffmpeg }}
+          DEST: ${{ env.ROOT }}/ffmpeg
+        run: |
+          gh release download $FFMPEG_TAG --repo jellyfin/jellyfin-ffmpeg --pattern "$PATTERN" --dir ffdl \
+            || { echo "No asset matched $PATTERN. Assets:"; gh release view $FFMPEG_TAG --repo jellyfin/jellyfin-ffmpeg --json assets -q '.assets[].name'; exit 1; }
+          ls ffdl
+          mkdir -p ffx "$DEST"
+          archive=$(ls ffdl/* | head -1)
+          case "$archive" in
+            *.zip) unzip -q "$archive" -d ffx ;;
+            *)     tar -xJf "$archive" -C ffx ;;
+          esac
+          for tool in ffmpeg ffprobe; do
+            src=$(find ffx -type f \( -name "$tool" -o -name "$tool.exe" \) | head -1)
+            cp "$src" "$DEST/"
+          done
+          chmod +x "$DEST"/* || true
+          basename ffdl/* > "$DEST/FFMPEG_ASSET"
+
+      - name: Add launcher and stamp
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ "${{ matrix.rid }}" = "win-x64" ]; then
+            cp atlas/launchers/atlas-server.cmd "$ROOT/"
+          else
+            cp atlas/launchers/atlas-server.sh "$ROOT/"
+            chmod +x "$ROOT/atlas-server.sh"
+          fi
+          {
+            echo "tag=${TAG:-none}"
+            echo "server=${GITHUB_SHA::7}"
+            echo "web=$(cat "$ROOT/jellyfin/jellyfin-web/WEB_COMMIT")"
+            echo "ffmpeg=$(cat "$ROOT/ffmpeg/FFMPEG_ASSET")"
+          } > "$ROOT/ATLAS_BUILD"
+
+      # tar keeps the executable bit; Windows gets a zip.
+      - name: Package
+        run: |
+          if [ "${{ matrix.rid }}" = "win-x64" ]; then
+            (cd out && zip -qr "../atlas-server-${{ matrix.name }}.zip" atlas-server)
+          else
+            tar -czf "atlas-server-${{ matrix.name }}.tar.gz" -C out atlas-server
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atlas-server-${{ matrix.name }}
+          path: atlas-server-${{ matrix.name }}.*
+
+  release:
+    needs: [macos, server]
+    if: ${{ always() && inputs.release_tag != '' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && (needs.macos.result == 'success' || needs.server.result == 'success') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: atlas-server-*
+      - run: ls -R artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          draft: true
+          name: Atlas Server ${{ inputs.release_tag }}
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Jellyfin server with Atlas ABR. Bundles jellyfin-web `${{ inputs.web_ref }}` and jellyfin-ffmpeg `${{ inputs.ffmpeg_tag || 'latest' }}`.
+
+            **macOS:** open the .dmg, drag Atlas Server to Applications, quit the stock Jellyfin Server app first. It isn't notarized, so the first launch needs System Settings > Privacy & Security > Open Anyway (or `xattr -dr com.apple.quarantine "/Applications/Atlas Server.app"`). Uses the same data folder as stock Jellyfin; back it up first.
+            **Linux / Windows:** extract and run `atlas-server.sh` / `atlas-server.cmd`.
