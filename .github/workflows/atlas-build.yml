@@ -1,8 +1,12 @@
 name: Atlas build
 
 # Builds a self-contained Jellyfin server with jellyfin-web bundled in,
-# for the Mac mini (osx-arm64) and Linux (linux-x64).
-# Run it from the Actions tab (Run workflow), or push to an atlas/* branch.
+# for the Mac mini (osx-arm64) and Linux (linux-x64), and publishes a GitHub release.
+#
+# - Push a tag like atlas-v1.0.0: builds and makes a release named after the tag.
+# - Run workflow (Actions tab): builds and makes a pre-release tagged atlas-build-<run number>.
+#   Untick "Create a release" to only build.
+# - Push to an atlas/* branch: builds only (artifacts on the run), no release.
 on:
   workflow_dispatch:
     inputs:
@@ -10,9 +14,19 @@ on:
         description: "jellyfin-web branch or tag to bundle"
         required: false
         default: "master"
+      release:
+        description: "Create a release"
+        type: boolean
+        required: false
+        default: true
   push:
     branches:
       - "atlas/**"
+    tags:
+      - "atlas-v*"
+
+permissions:
+  contents: read
 
 env:
   SDK_VERSION: "10.0.x"
@@ -86,3 +100,88 @@ jobs:
           name: jellyfin-atlas-${{ matrix.rid }}
           path: jellyfin-atlas-${{ matrix.rid }}.tar.gz
           retention-days: 14
+
+  release:
+    needs: server
+    if: startsWith(github.ref, 'refs/tags/atlas-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: jellyfin-atlas-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEB_REF: ${{ github.event.inputs.web_ref || 'master' }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            FLAGS=""
+          else
+            TAG="atlas-build-${GITHUB_RUN_NUMBER}"
+            FLAGS="--prerelease --target ${GITHUB_SHA}"
+          fi
+
+          cat > notes.md <<NOTES
+          Jellyfin server with Atlas ABR, jellyfin-web bundled.
+
+          - Commit: ${GITHUB_SHA::7} on ${GITHUB_REF_NAME}
+          - jellyfin-web: ${WEB_REF}
+
+          Mac mini: download jellyfin-atlas-osx-arm64.tar.gz, then
+          \`tar -xzf jellyfin-atlas-osx-arm64.tar.gz && xattr -dr com.apple.quarantine jellyfin\`
+          NOTES
+
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Atlas $TAG" \
+            --notes-file notes.md \
+            $FLAGS
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: server
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: jellyfin-atlas-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag }}
+          PRERELEASE: ${{ github.event.inputs.prerelease }}
+          WEB_REF: ${{ github.event.inputs.web_ref || 'master' }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS.txt
+
+          notes="Atlas build of ${GITHUB_SHA::7} (${GITHUB_REF_NAME}), jellyfin-web ${WEB_REF}."
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # Re-running with the same tag replaces the files on the existing release.
+            gh release upload "$TAG" *.tar.gz SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            flags=()
+            if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+            gh release create "$TAG" *.tar.gz SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Jellyfin Atlas $TAG" \
+              --notes "$notes" \
+              "${flags[@]}"
+          fi
