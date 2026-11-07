@@ -123,12 +123,28 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
 
         List<TranscodingJob> jobs;
 
+        var now = DateTime.UtcNow;
         lock (_activeTranscodingJobs)
         {
             // This is really only needed for HLS.
             // Progressive streams can stop on their own reliably.
             jobs = _activeTranscodingJobs.Where(j => string.Equals(playSessionId, j.PlaySessionId, StringComparison.OrdinalIgnoreCase)).ToList();
         }
+
+        // Atlas ABR: keep alive only the quality level the player is fetching (the most recently used
+        // one, even while paused). A level it switched away from stops getting pinged and times out.
+        var latestAtlasActivity = DateTime.MinValue;
+        foreach (var job in jobs)
+        {
+            if (!string.IsNullOrEmpty(job.AtlasLevel) && job.AtlasLastActivityUtc > latestAtlasActivity)
+            {
+                latestAtlasActivity = job.AtlasLastActivityUtc;
+            }
+        }
+
+        jobs.RemoveAll(j => !string.IsNullOrEmpty(j.AtlasLevel)
+            && j.AtlasLastActivityUtc < latestAtlasActivity
+            && AtlasAbrSettings.IsIdle(j.AtlasLastActivityUtc, now));
 
         foreach (var job in jobs)
         {
@@ -213,6 +229,46 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
                 yield return KillTranscodingJob(job, false, deleteFiles);
             }
         }
+    }
+
+    /// <inheritdoc />
+    public Task KillTranscodingJobs(Func<TranscodingJob, bool> predicate, Func<string, bool> deleteFiles)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+
+        List<TranscodingJob> jobs;
+        lock (_activeTranscodingJobs)
+        {
+            jobs = _activeTranscodingJobs.Where(predicate).ToList();
+        }
+
+        return Task.WhenAll(jobs.Select(job => KillTranscodingJob(job, false, deleteFiles)));
+    }
+
+    /// <inheritdoc />
+    public Task OnAtlasLevelSegmentServed(TranscodingJob job)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+
+        if (string.IsNullOrEmpty(job.AtlasLevel) || string.IsNullOrEmpty(job.PlaySessionId))
+        {
+            return Task.CompletedTask;
+        }
+
+        var now = DateTime.UtcNow;
+        job.AtlasLastActivityUtc = now;
+
+        // The level that just served a segment is the one being watched. Stop the session's other
+        // levels once nothing has asked them for a segment in a while, so a level the player only
+        // probed, or switched away from, doesn't keep a transcode running.
+        return KillTranscodingJobs(
+            other => !ReferenceEquals(other, job)
+                && !string.IsNullOrEmpty(other.AtlasLevel)
+                && string.Equals(other.PlaySessionId, job.PlaySessionId, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(other.AtlasLevel, job.AtlasLevel, StringComparison.Ordinal)
+                && other.ActiveRequestCount <= 0
+                && AtlasAbrSettings.IsIdle(other.AtlasLastActivityUtc, now),
+            _ => true);
     }
 
     private async Task KillTranscodingJob(TranscodingJob job, bool closeLiveStream, Func<string, bool> delete)
@@ -598,7 +654,9 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
                 Id = transcodingJobId,
                 PlaySessionId = playSessionId,
                 LiveStreamId = liveStreamId,
-                MediaSource = state.MediaSource
+                MediaSource = state.MediaSource,
+                AtlasLevel = state.AtlasLevel,
+                AtlasLastActivityUtc = DateTime.UtcNow
             };
 
             _activeTranscodingJobs.Add(job);

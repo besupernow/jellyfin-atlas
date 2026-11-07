@@ -43,6 +43,22 @@ public interface ITranscodeManager
     public Task KillTranscodingJobs(string deviceId, string? playSessionId, Func<string, bool> deleteFiles);
 
     /// <summary>
+    /// Kills every active transcoding job that matches a predicate.
+    /// </summary>
+    /// <param name="predicate">Selects the jobs to kill.</param>
+    /// <param name="deleteFiles">Decides, per output path, whether the job's files are deleted.</param>
+    /// <returns>Task.</returns>
+    public Task KillTranscodingJobs(Func<TranscodingJob, bool> predicate, Func<string, bool> deleteFiles);
+
+    /// <summary>
+    /// Records that a segment of an Atlas ABR quality level was served, and stops the other levels
+    /// of the same play session that have gone idle (the player switched away from them).
+    /// </summary>
+    /// <param name="job">The job that served the segment.</param>
+    /// <returns>Task.</returns>
+    public Task OnAtlasLevelSegmentServed(TranscodingJob job);
+
+    /// <summary>
     /// Report the transcoding progress to the session manager.
     /// </summary>
     /// <param name="job">The <see cref="TranscodingJob"/> of which the progress will be reported.</param>

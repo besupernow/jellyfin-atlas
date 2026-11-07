@@ -255,6 +255,18 @@ public static class StreamingHelpers
             ? GetOutputFileExtension(state, mediaSource)
             : ("." + GetContainerFileExtension(state.OutputContainer));
 
+        // Atlas ABR: the quality level this variant playlist / segment belongs to. It has to be known
+        // before the output path is built, because every level gets its own transcode files.
+        var atlasLevel = httpRequest.Query[AtlasAbrSettings.LevelParameter].ToString();
+        if (AtlasAbrSettings.Enabled && AtlasAbrSettings.IsValidLevel(atlasLevel))
+        {
+            state.AtlasLevel = atlasLevel;
+            state.AtlasKeyframeSegments = string.Equals(
+                httpRequest.Query[AtlasAbrSettings.SegmentsParameter].ToString(),
+                AtlasAbrSettings.KeyframeSegments,
+                StringComparison.Ordinal);
+        }
+
         state.OutputFilePath = GetOutputFilePath(state, ext, serverConfigurationManager, streamingRequest.DeviceId, streamingRequest.PlaySessionId);
 
         return state;
@@ -377,6 +389,12 @@ public static class StreamingHelpers
     private static string GetOutputFilePath(StreamState state, string outputFileExtension, IServerConfigurationManager serverConfigurationManager, string? deviceId, string? playSessionId)
     {
         var data = $"{state.MediaPath}-{state.UserAgent}-{deviceId!}-{playSessionId!}";
+
+        // Atlas ABR: one folder per quality level, so levels never write over each other's segments.
+        if (state.IsAtlasLevel)
+        {
+            data += "-atlas-" + state.AtlasLevel;
+        }
 
         var filename = data.GetMD5().ToString("N", CultureInfo.InvariantCulture);
         var ext = outputFileExtension.ToLowerInvariant();
