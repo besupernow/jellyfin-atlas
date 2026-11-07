@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace Jellyfin.MediaEncoding.Hls.Playlist;
 
@@ -69,4 +70,10 @@ public class CreateMainPlaylistRequest
     /// Gets a value indicating whether the video is being remuxed.
     /// </summary>
     public bool IsRemuxingVideo { get; }
+
+    /// <summary>
+    /// Gets the exact segment lengths in seconds, overriding the computed ones. Atlas ABR uses this so
+    /// every quality level of a playback lists the same segment boundaries.
+    /// </summary>
+    public IReadOnlyList<double>? SegmentLengths { get; init; }
 }

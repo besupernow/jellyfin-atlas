@@ -34,11 +34,16 @@ public class DynamicHlsPlaylistGenerator : IDynamicHlsPlaylistGenerator
     public string CreateMainPlaylist(CreateMainPlaylistRequest request)
     {
         IReadOnlyList<double> segments;
-        // For video transcodes it is sufficient with equal length segments as ffmpeg will create new keyframes
-        if (request.IsRemuxingVideo
+        if (request.SegmentLengths is { Count: > 0 })
+        {
+            // Atlas ABR: boundaries shared by every quality level.
+            segments = request.SegmentLengths;
+        }
+        else if (request.IsRemuxingVideo
             && request.MediaSourceId is not null
             && TryExtractKeyframes(request.MediaSourceId.Value, request.FilePath, out var keyframeData))
         {
+            // For video transcodes it is sufficient with equal length segments as ffmpeg will create new keyframes
             segments = ComputeSegments(keyframeData, request.DesiredSegmentLengthMs);
         }
         else
