@@ -1,0 +1,88 @@
+name: Atlas build
+
+# Builds a self-contained Jellyfin server with jellyfin-web bundled in,
+# for the Mac mini (osx-arm64) and Linux (linux-x64).
+# Run it from the Actions tab (Run workflow), or push to an atlas/* branch.
+on:
+  workflow_dispatch:
+    inputs:
+      web_ref:
+        description: "jellyfin-web branch or tag to bundle"
+        required: false
+        default: "master"
+  push:
+    branches:
+      - "atlas/**"
+
+env:
+  SDK_VERSION: "10.0.x"
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: jellyfin/jellyfin-web
+          ref: ${{ github.event.inputs.web_ref || 'master' }}
+          path: web
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build jellyfin-web
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:production
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jellyfin-web
+          path: web/dist
+          retention-days: 1
+
+  server:
+    needs: web
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rid: ["osx-arm64", "linux-x64"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Test Atlas segment math
+        run: dotnet test tests/Jellyfin.Api.Tests --configuration Release --filter AtlasSegmentGrid --verbosity minimal
+
+      - name: Publish server
+        run: >
+          dotnet publish Jellyfin.Server
+          --configuration Release
+          --runtime ${{ matrix.rid }}
+          --self-contained true
+          -p:DebugSymbols=false
+          -p:DebugType=none
+          --output out/jellyfin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jellyfin-web
+          path: out/jellyfin/jellyfin-web
+
+      # tar keeps the executable bit, a plain artifact zip doesn't.
+      - name: Package
+        run: |
+          echo "${GITHUB_SHA::7}" > out/jellyfin/ATLAS_BUILD
+          tar -czf jellyfin-atlas-${{ matrix.rid }}.tar.gz -C out jellyfin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jellyfin-atlas-${{ matrix.rid }}
+          path: jellyfin-atlas-${{ matrix.rid }}.tar.gz
+          retention-days: 14
