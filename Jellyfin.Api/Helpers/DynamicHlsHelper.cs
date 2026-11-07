@@ -749,8 +749,10 @@ public class DynamicHlsHelper
                 query.Remove("Width");
                 query.Remove("Height");
 
-                // A capped transcode can still burst above its target within one short segment.
-                peak = (long)(((level.VideoBitrate * 1.4) + audioBitrate) * Overhead);
+                // A capped transcode can still burst a little above its target within one short
+                // segment (VideoToolbox stays close to it). Overstating this makes players refuse
+                // to step up, so keep it tight.
+                peak = (long)(((level.VideoBitrate * 1.15) + audioBitrate) * Overhead);
                 average = (long)((level.VideoBitrate + audioBitrate) * Overhead);
 
                 line.Append("#EXT-X-STREAM-INF:BANDWIDTH=").Append(peak.ToString(CultureInfo.InvariantCulture))
@@ -782,9 +784,8 @@ public class DynamicHlsHelper
             variants.Add((peak, line.ToString()));
         }
 
-        // AVPlayer starts on the first variant listed, so the level that fits the client's expected
-        // bandwidth goes first. Without a hint, start around 720p.
-        var startIndex = GetAtlasStartIndex(variants, levels);
+        // The start level goes first (see GetAtlasStartIndex).
+        var startIndex = GetAtlasStartIndex(levels);
         builder.Insert(GetFirstLineEnd(builder), "#EXT-X-INDEPENDENT-SEGMENTS" + Environment.NewLine);
         builder.Append(variants[startIndex].Text);
         for (var i = 0; i < variants.Count; i++)
@@ -796,35 +797,21 @@ public class DynamicHlsHelper
         }
     }
 
-    private int GetAtlasStartIndex(List<(long Peak, string Text)> variants, IReadOnlyList<AtlasAbrLevel> levels)
+    private static int GetAtlasStartIndex(IReadOnlyList<AtlasAbrLevel> levels)
     {
-        var hint = _httpContextAccessor.HttpContext?.Request.Query[AtlasAbrSettings.StartBitrateParameter].ToString();
-        if (long.TryParse(hint, NumberStyles.Integer, CultureInfo.InvariantCulture, out var startBitrate) && startBitrate > 0)
-        {
-            // Leave headroom: a level that needs all of the measured bandwidth will stall.
-            var budget = startBitrate * 0.8;
-            var best = 0;
-            for (var i = 0; i < variants.Count; i++)
-            {
-                if (variants[i].Peak <= budget)
-                {
-                    best = i;
-                }
-            }
-
-            return best;
-        }
-
-        var start = 0;
+        // The first listed variant is where AVPlayer and hls.js start (the app gives ExoPlayer a
+        // matching first estimate), so this decides time to first frame. Always the lowest rung
+        // (480p at 1.5 Mbps by default): its first segment encodes and downloads fastest, and the
+        // player climbs, or jumps straight up, as soon as it has measured the connection.
         for (var i = 0; i < levels.Count; i++)
         {
-            if (levels[i].Height <= 720)
+            if (!levels[i].IsOriginal)
             {
-                start = i;
+                return i;
             }
         }
 
-        return start;
+        return 0;
     }
 
     private static int GetFirstLineEnd(StringBuilder builder)

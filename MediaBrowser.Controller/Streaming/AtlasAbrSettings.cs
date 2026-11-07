@@ -17,7 +17,7 @@ namespace MediaBrowser.Controller.Streaming;
 /// <item><c>ATLAS_ABR_GRID_SECONDS</c>: the keyframe interval the library was conformed to, and the segment length (default 2).</item>
 /// <item><c>ATLAS_ABR_IDLE_LEVEL_SECONDS</c>: how long a quality level may go without segment requests before it is stopped (default 20).</item>
 /// <item><c>ATLAS_ABR_PEAK_FACTOR</c>: peak/average bitrate ratio assumed for the original file until it has been analyzed (default 1.8).</item>
-/// <item><c>ATLAS_ABR_LADDER</c>: transcoded levels as <c>height:kbps</c> pairs (default <c>360:800,480:1500,720:3500,1080:7000</c>).</item>
+/// <item><c>ATLAS_ABR_LADDER</c>: transcoded levels as <c>height:kbps</c> pairs (default <c>480:1500,720:2000,720:4000,1080:8000,1080:12000,1080:20000</c>, the app's quality presets).</item>
 /// </list>
 /// </remarks>
 public static class AtlasAbrSettings
@@ -87,7 +87,7 @@ public static class AtlasAbrSettings
     /// <summary>
     /// Gets the transcoded levels, lowest first.
     /// </summary>
-    public static IReadOnlyList<(int Height, int VideoBitrate)> Ladder { get; } = ReadLadder("ATLAS_ABR_LADDER", "360:800,480:1500,720:3500,1080:7000");
+    public static IReadOnlyList<(int Height, int VideoBitrate)> Ladder { get; } = ReadLadder("ATLAS_ABR_LADDER", "480:1500,720:2000,720:4000,1080:8000,1080:12000,1080:20000");
 
     /// <summary>
     /// Gets a value indicating whether a quality level has gone idle.
@@ -171,7 +171,7 @@ public static class AtlasAbrSettings
             }
         }
 
-        levels.Sort((a, b) => a.Height.CompareTo(b.Height));
+        levels.Sort((a, b) => a.Height != b.Height ? a.Height.CompareTo(b.Height) : a.VideoBitrate.CompareTo(b.VideoBitrate));
         return levels;
     }
 }

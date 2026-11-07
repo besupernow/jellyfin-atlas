@@ -31,25 +31,33 @@ internal static class AtlasAbrLadder
             return levels;
         }
 
+        // Rungs are named by the 16:9 frame they fit (720 = 1280 wide), so a scope film's
+        // 1920x800 counts as 1080 and its 720 rung is 1280x534, not 1720x720.
+        var equivalentHeight = Math.Max(sourceHeight, (int)Math.Round(sourceWidth * 9.0 / 16.0));
+
         foreach (var (height, bitrate) in AtlasAbrSettings.Ladder)
         {
-            // Only levels that are actually smaller than the source: a transcode at the source's own
-            // resolution (or with more bits than the source has) is just a worse copy of the original.
-            if (height > sourceHeight - 32)
+            // No rung bigger than the source.
+            if (height > equivalentHeight + 8)
             {
                 continue;
             }
 
-            if (sourceVideoBitrate > 0 && bitrate > sourceVideoBitrate * 0.9)
+            // A rung needs clearly fewer bits than the original, or it's a worse copy of it.
+            // This keeps a same-resolution rung (1080 at 7 Mbps under a 15 Mbps 1080p original),
+            // which is the step players need between 720 and the original.
+            if (sourceVideoBitrate > 0 && bitrate > sourceVideoBitrate * 0.65)
             {
                 continue;
             }
 
+            var scale = Math.Min(1.0, (double)height / equivalentHeight);
             levels.Add(new AtlasAbrLevel
             {
-                Id = "h" + height.ToString(CultureInfo.InvariantCulture),
-                Width = ScaleWidth(sourceWidth, sourceHeight, height),
-                Height = height,
+                // Height and bitrate: the ladder can hold two rungs of one height (720 at 2 and 4 Mbps).
+                Id = "h" + height.ToString(CultureInfo.InvariantCulture) + "b" + (bitrate / 1000).ToString(CultureInfo.InvariantCulture),
+                Width = Even(sourceWidth * scale),
+                Height = Even(sourceHeight * scale),
                 VideoBitrate = bitrate
             });
         }
@@ -67,12 +75,15 @@ internal static class AtlasAbrLadder
         }
         else
         {
+            // A full resolution rung that is nearly the top transcode only doubles the work.
+            var topBitrate = GetTopBitrate(sourceHeight, sourceVideoBitrate);
+            levels.RemoveAll(level => level.Height >= sourceHeight - 8 && level.VideoBitrate >= topBitrate * 0.8);
             levels.Add(new AtlasAbrLevel
             {
                 Id = AtlasAbrSettings.TopLevel,
                 Width = sourceWidth,
                 Height = sourceHeight,
-                VideoBitrate = GetTopBitrate(sourceHeight, sourceVideoBitrate)
+                VideoBitrate = topBitrate
             });
         }
 
@@ -101,10 +112,9 @@ internal static class AtlasAbrLadder
         return (int)Math.Min(topBitrate * scale * scale, MaxTopBitrate);
     }
 
-    private static int ScaleWidth(int sourceWidth, int sourceHeight, int height)
+    private static int Even(double value)
     {
-        // Keep the aspect ratio, rounded to an even number for the encoder.
-        var width = (double)sourceWidth * height / sourceHeight;
-        return Math.Max(2, (int)Math.Round(width / 2) * 2);
+        // The encoder wants even dimensions.
+        return Math.Max(2, (int)Math.Round(value / 2) * 2);
     }
 }
