@@ -34,9 +34,10 @@ namespace MediaBrowser.MediaEncoding.Transcoding;
 public sealed class TranscodeManager : ITranscodeManager, IDisposable
 {
     /// <summary>
-    /// How long an Atlas ABR warm-up level is kept running without the player coming to it.
+    /// How long an Atlas ABR warm-up level is kept running after the player last asked about it. The
+    /// player asks about once a second while it wants the level, so this only runs out once it doesn't.
     /// </summary>
-    private static readonly TimeSpan _atlasWarmLifetime = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan _atlasWarmLifetime = TimeSpan.FromSeconds(15);
 
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TranscodeManager> _logger;
@@ -141,14 +142,15 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         var latestAtlasActivity = DateTime.MinValue;
         foreach (var job in jobs)
         {
-            if (!string.IsNullOrEmpty(job.AtlasLevel) && job.AtlasLastActivityUtc > latestAtlasActivity)
+            // Warm-ups are asked about, not watched: they don't decide which level is being watched.
+            if (!string.IsNullOrEmpty(job.AtlasLevel) && !job.AtlasWarm && job.AtlasLastActivityUtc > latestAtlasActivity)
             {
                 latestAtlasActivity = job.AtlasLastActivityUtc;
             }
         }
 
-        // A warm-up level (started for the player to switch up to) stays pinged for a while too;
-        // if the player hasn't come to it by then it times out, and the next one starts fresh.
+        // A warm-up level the player is asking for stays pinged too; once it stops asking (it went
+        // somewhere else, or no longer wants to go up), the warm-up times out.
         jobs.RemoveAll(j => !string.IsNullOrEmpty(j.AtlasLevel)
             && j.AtlasLastActivityUtc < latestAtlasActivity
             && AtlasAbrSettings.IsIdle(j.AtlasLastActivityUtc, now)
@@ -283,14 +285,25 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
     }
 
     /// <inheritdoc />
-    public bool HasAtlasLevelJob(string playSessionId, string level)
+    public TranscodingJob? GetAtlasLevelJob(string playSessionId, string level)
     {
         lock (_activeTranscodingJobs)
         {
-            return _activeTranscodingJobs.Any(j => string.Equals(j.PlaySessionId, playSessionId, StringComparison.OrdinalIgnoreCase)
+            return _activeTranscodingJobs.FirstOrDefault(j => string.Equals(j.PlaySessionId, playSessionId, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(j.AtlasLevel, level, StringComparison.Ordinal)
                 && !j.HasExited);
         }
+    }
+
+    /// <inheritdoc />
+    public void TouchAtlasWarm(TranscodingJob job)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+
+        // Also covers a level the player left a moment ago and now wants back: it is kept instead of
+        // being stopped as idle. The flag clears when the player fetches from it again.
+        job.AtlasWarm = true;
+        job.AtlasLastActivityUtc = DateTime.UtcNow;
     }
 
     /// <inheritdoc />

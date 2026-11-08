@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -887,37 +888,85 @@ public class DynamicHlsHelper
     }
 
     /// <summary>
-    /// Atlas ABR: called when the player has been served a segment of a level. Gets the next level up
-    /// transcoding from the following segment, so when the player steps up, that level's segments are
-    /// ready (or nearly) instead of a transcoder starting from cold while the buffer drains. The original
-    /// (a stream copy) starts instantly, so it is never warmed.
+    /// Atlas ABR: the player wants to switch up to <paramref name="level"/> and would fetch
+    /// <paramref name="segment"/> next. Makes sure that level is transcoding from there (starting a
+    /// warm-up when it isn't) and says whether it is far enough ahead to switch to now.
     /// </summary>
+    /// <remarks>
+    /// The player asks about once a second until the answer is yes, then switches; it only asks while
+    /// it wants to go up, so nothing is transcoded ahead for a level nobody is about to watch. A
+    /// warm-up the player stops asking about times out on its own (see TranscodeManager).
+    /// </remarks>
+    /// <param name="itemId">The item id (N format).</param>
     /// <param name="playSessionId">The play session id.</param>
-    /// <param name="level">The level that was served.</param>
-    /// <param name="segmentIndex">The segment that was served.</param>
-    public void WarmNextAtlasLevel(string? playSessionId, string level, int segmentIndex)
+    /// <param name="level">The level to switch to.</param>
+    /// <param name="segment">The next segment the player would fetch.</param>
+    /// <returns><c>true</c> if ready, <c>false</c> if warming, <c>null</c> if the session or level is unknown.</returns>
+    public bool? WarmAtlasLevel(string itemId, string playSessionId, string level, int segment)
     {
-        if (!AtlasAbrSettings.Prewarm || string.IsNullOrEmpty(playSessionId) || !AtlasSessionLadder.TryGet(playSessionId, out var session))
+        if (!AtlasAbrSettings.Enabled
+            || !AtlasSessionLadder.TryGet(playSessionId, out var session)
+            || !string.Equals(session.ItemId, itemId, StringComparison.OrdinalIgnoreCase))
         {
-            return;
+            return null;
         }
 
         var index = Array.IndexOf(session.LevelIds, level);
-        var next = index + 1;
-        if (index < 0 || next >= session.LevelIds.Length || session.IsOriginal[next] || segmentIndex + 1 >= session.SegmentCount)
+        if (index < 0)
         {
-            return;
+            return null;
         }
 
-        var nextLevel = session.LevelIds[next];
-        if (_transcodeManager.HasAtlasLevelJob(playSessionId, nextLevel) || !session.TryClaimWarm(nextLevel))
+        if (segment < 0 || segment >= session.SegmentCount)
         {
-            return;
+            return false;
         }
 
-        _ = _transcodeManager.KillAtlasWarmJobs(playSessionId, nextLevel);
-        FetchAtlasSegment(session, next, segmentIndex + 1, warm: true);
+        // Jellyfin serves a segment once the one after it exists, so "ready" means a few past it.
+        var readyAt = Math.Min(segment + AtlasAbrSettings.WarmReadySegments, session.SegmentCount - 1);
+        var segmentSeconds = Math.Max(1.0, (double)session.SegmentLengthTicks[segment] / TimeSpan.TicksPerSecond);
+        var restartGap = Math.Max(1, (int)(24 / segmentSeconds));
+
+        var job = _transcodeManager.GetAtlasLevelJob(playSessionId, level);
+        if (job?.Path is not null)
+        {
+            // Asked for: keep it alive (a level the player left a moment ago counts too).
+            _transcodeManager.TouchAtlasWarm(job);
+            if (File.Exists(GetAtlasSegmentPath(job.Path, readyAt, session.Container)))
+            {
+                return true;
+            }
+
+            if (File.Exists(GetAtlasSegmentPath(job.Path, segment, session.Container)))
+            {
+                return false;
+            }
+
+            // Not there yet. Fine if this warm-up started at or before it and isn't too far behind;
+            // otherwise the switch would restart it anyway, so restart it from here now.
+            if (session.TryGetWarmStart(level, out var start)
+                && segment >= start
+                && (segment - restartGap < start || File.Exists(GetAtlasSegmentPath(job.Path, segment - restartGap, session.Container))))
+            {
+                return false;
+            }
+        }
+
+        if (session.TryStartWarm(level, segment))
+        {
+            // One warm-up per session: a different level asked for earlier isn't wanted any more.
+            _ = _transcodeManager.KillAtlasWarmJobs(playSessionId, level);
+            _logger.LogDebug("Atlas ABR: player wants {Level}, warming it from segment {Segment}", level, segment);
+            FetchAtlasSegment(session, index, segment, warm: true);
+        }
+
+        return false;
     }
+
+    private static string GetAtlasSegmentPath(string playlistPath, int index, string container)
+        => Path.Combine(
+            Path.GetDirectoryName(playlistPath) ?? string.Empty,
+            Path.GetFileNameWithoutExtension(playlistPath) + index.ToString(CultureInfo.InvariantCulture) + "." + container);
 
     /// <summary>
     /// Requests a segment of a level from this server over its local address, exactly as the player
