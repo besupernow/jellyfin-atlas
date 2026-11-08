@@ -24,6 +24,7 @@ internal static class AtlasSourceAnalyzer
     private static readonly ConcurrentDictionary<string, AtlasSourceInfo> _memory = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, byte> _queued = new(StringComparer.Ordinal);
     private static readonly SemaphoreSlim _scanGate = new(1, 1);
+    private static readonly TimeSpan _scanStartDelay = TimeSpan.FromSeconds(20);
     private static readonly JsonSerializerOptions _jsonOptions = new();
     private static readonly TimeSpan _scanTimeout = TimeSpan.FromMinutes(30);
 
@@ -88,6 +89,9 @@ internal static class AtlasSourceAnalyzer
 
     private static async Task ScanAndStoreAsync(string mediaSourceId, string mediaPath, string probePath, string cacheDirectory, int gridSeconds, ILogger logger)
     {
+        // Let the play that queued this get going first: the scan reads the whole file,
+        // and doing that while the first segments are being transcoded slows startup.
+        await Task.Delay(_scanStartDelay).ConfigureAwait(false);
         await _scanGate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -154,6 +158,15 @@ internal static class AtlasSourceAnalyzer
         }
 
         process.Start();
+        try
+        {
+            // Background work: never compete with a transcode for the CPU.
+            process.PriorityClass = ProcessPriorityClass.BelowNormal;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception or PlatformNotSupportedException)
+        {
+            // Not allowed here or already exited; the scan still runs.
+        }
 
         double formatStart = double.NaN;
         double fps = 0;
