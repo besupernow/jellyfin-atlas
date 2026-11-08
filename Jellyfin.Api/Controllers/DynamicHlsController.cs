@@ -704,6 +704,7 @@ public class DynamicHlsController : BaseJellyfinApiController
     /// <param name="playSessionId">The play session id of the Atlas master playlist.</param>
     /// <param name="level">The level id, from the variant's AtlasLevel parameter.</param>
     /// <param name="segment">The next segment the player would fetch.</param>
+    /// <param name="positionTicks">Or, for a player that only knows times (AVPlayer), the position to warm from.</param>
     /// <response code="200">Whether the level is ready to switch to.</response>
     /// <response code="404">Unknown session or level.</response>
     /// <returns>An <see cref="AtlasWarmResult"/>.</returns>
@@ -714,14 +715,15 @@ public class DynamicHlsController : BaseJellyfinApiController
         [FromRoute, Required] Guid itemId,
         [FromQuery, Required] string playSessionId,
         [FromQuery, Required] string level,
-        [FromQuery, Required] int segment)
+        [FromQuery] int? segment,
+        [FromQuery] long? positionTicks)
     {
-        if (!AtlasAbrSettings.IsValidLevel(level))
+        if (!AtlasAbrSettings.IsValidLevel(level) || (segment is null && positionTicks is null))
         {
             return NotFound();
         }
 
-        var ready = _dynamicHlsHelper.WarmAtlasLevel(itemId.ToString("N", CultureInfo.InvariantCulture), playSessionId, level, segment);
+        var ready = _dynamicHlsHelper.WarmAtlasLevel(itemId.ToString("N", CultureInfo.InvariantCulture), playSessionId, level, segment, positionTicks);
         if (ready is null)
         {
             return NotFound();
