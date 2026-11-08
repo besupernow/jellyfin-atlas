@@ -45,6 +45,23 @@ public static class AtlasAbrSettings
     public const string StartTicksParameter = "AtlasStartTicks";
 
     /// <summary>
+    /// The master playlist query parameter pinning one quality (a manual pick in the app), in bits per
+    /// second. With <see cref="MaxHeightParameter"/> it replaces the ladder with a single level.
+    /// </summary>
+    public const string MaxBitrateParameter = "AtlasMaxBitrate";
+
+    /// <summary>
+    /// The master playlist query parameter with the pinned quality's height (see <see cref="MaxBitrateParameter"/>).
+    /// </summary>
+    public const string MaxHeightParameter = "AtlasMaxHeight";
+
+    /// <summary>
+    /// The segment query parameter marking the server's own warm-up request for the next level up, so
+    /// that level is already transcoding when the player switches to it.
+    /// </summary>
+    public const string WarmParameter = "AtlasWarm";
+
+    /// <summary>
     /// The variant playlist and segment query parameter saying where segment boundaries come from:
     /// <see cref="KeyframeSegments"/> or <see cref="GridSegments"/>.
     /// </summary>

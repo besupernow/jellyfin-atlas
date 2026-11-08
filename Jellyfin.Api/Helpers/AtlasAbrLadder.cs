@@ -90,6 +90,57 @@ internal static class AtlasAbrLadder
         return levels;
     }
 
+    /// <summary>
+    /// Builds a single-level "ladder" for a quality picked by hand: the original when it already fits
+    /// the pick (and can be stream copied), otherwise one transcode at the picked height and bitrate.
+    /// </summary>
+    /// <param name="sourceWidth">The source width.</param>
+    /// <param name="sourceHeight">The source height.</param>
+    /// <param name="sourceVideoBitrate">The source's average video bitrate, or 0 if unknown.</param>
+    /// <param name="includeOriginal">Whether the original can be a level (stream copy, keyframes aligned).</param>
+    /// <param name="maxHeight">The picked height (16:9 frame height: 720, 1080).</param>
+    /// <param name="maxBitrate">The picked video bitrate, in bits per second.</param>
+    /// <returns>The one level, or none if the source size is unknown.</returns>
+    public static IReadOnlyList<AtlasAbrLevel> Pin(int sourceWidth, int sourceHeight, long sourceVideoBitrate, bool includeOriginal, int maxHeight, int maxBitrate)
+    {
+        if (sourceWidth <= 0 || sourceHeight <= 0)
+        {
+            return [];
+        }
+
+        var equivalentHeight = Math.Max(sourceHeight, (int)Math.Round(sourceWidth * 9.0 / 16.0));
+        if (includeOriginal && sourceVideoBitrate > 0 && sourceVideoBitrate <= maxBitrate && equivalentHeight <= maxHeight + 8)
+        {
+            return
+            [
+                new AtlasAbrLevel
+                {
+                    Id = AtlasAbrSettings.OriginalLevel,
+                    IsOriginal = true,
+                    Width = sourceWidth,
+                    Height = sourceHeight,
+                    VideoBitrate = (int)Math.Min(sourceVideoBitrate, int.MaxValue)
+                }
+            ];
+        }
+
+        var height = Math.Min(maxHeight, equivalentHeight);
+        var scale = Math.Min(1.0, (double)height / equivalentHeight);
+
+        // Never more bits than the original has: that only makes a bigger copy of it.
+        var bitrate = sourceVideoBitrate > 0 ? (int)Math.Min(maxBitrate, sourceVideoBitrate) : maxBitrate;
+        return
+        [
+            new AtlasAbrLevel
+            {
+                Id = "p" + height.ToString(CultureInfo.InvariantCulture) + "b" + (bitrate / 1000).ToString(CultureInfo.InvariantCulture),
+                Width = Even(sourceWidth * scale),
+                Height = Even(sourceHeight * scale),
+                VideoBitrate = bitrate
+            }
+        ];
+    }
+
     private static int GetTopBitrate(int sourceHeight, long sourceVideoBitrate)
     {
         if (sourceVideoBitrate > 0)

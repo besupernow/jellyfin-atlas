@@ -55,8 +55,25 @@ public interface ITranscodeManager
     /// of the same play session that have gone idle (the player switched away from them).
     /// </summary>
     /// <param name="job">The job that served the segment.</param>
+    /// <param name="warmRequest">Whether the segment went to the server's own warm-up request rather than the player.</param>
     /// <returns>Task.</returns>
-    public Task OnAtlasLevelSegmentServed(TranscodingJob job);
+    public Task OnAtlasLevelSegmentServed(TranscodingJob job, bool warmRequest);
+
+    /// <summary>
+    /// Gets a value indicating whether an Atlas ABR level of a playback session is transcoding.
+    /// </summary>
+    /// <param name="playSessionId">The play session id.</param>
+    /// <param name="level">The level id.</param>
+    /// <returns><c>true</c> if a job for that level is running.</returns>
+    public bool HasAtlasLevelJob(string playSessionId, string level);
+
+    /// <summary>
+    /// Stops a session's warm-up jobs other than <paramref name="keepLevel"/>.
+    /// </summary>
+    /// <param name="playSessionId">The play session id.</param>
+    /// <param name="keepLevel">The level to keep.</param>
+    /// <returns>Task.</returns>
+    public Task KillAtlasWarmJobs(string playSessionId, string keepLevel);
 
     /// <summary>
     /// Report the transcoding progress to the session manager.

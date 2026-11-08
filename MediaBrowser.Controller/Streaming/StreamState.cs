@@ -86,6 +86,12 @@ public class StreamState : EncodingJobInfo, IDisposable
     public bool AtlasKeyframeSegments { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether this is the server's own warm-up request for an Atlas ABR
+    /// level (not the player).
+    /// </summary>
+    public bool AtlasWarm { get; set; }
+
+    /// <summary>
     /// Gets the segment length.
     /// </summary>
     public int SegmentLength

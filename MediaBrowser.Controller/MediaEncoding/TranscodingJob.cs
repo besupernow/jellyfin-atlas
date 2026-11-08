@@ -170,6 +170,12 @@ public sealed class TranscodingJob : IDisposable
     public DateTime AtlasLastActivityUtc { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether this Atlas ABR level was started ahead of time for the
+    /// player to switch up to, and the player hasn't asked it for anything yet.
+    /// </summary>
+    public bool AtlasWarm { get; set; }
+
+    /// <summary>
     /// Records the end position of a served segment.
     /// </summary>
     /// <param name="segmentIndex">The segment index.</param>
