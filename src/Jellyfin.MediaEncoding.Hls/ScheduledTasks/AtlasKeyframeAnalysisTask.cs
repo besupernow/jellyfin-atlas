@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
@@ -19,12 +20,14 @@ namespace Jellyfin.MediaEncoding.Hls.ScheduledTasks;
 
 /// <summary>
 /// Atlas ABR: analyzes the library's video files ahead of time (keyframe positions, frame rate and
-/// bitrate peaks), so no playback has to wait for that work.
+/// bitrate peaks) and extracts their embedded subtitles, so no playback has to wait for that work.
 /// </summary>
 /// <remarks>
 /// A file's first adaptive play otherwise gets an all-transcode ladder while the analysis runs in
 /// the background. Analyzed files can offer the original as the top level from the first play.
 /// Results go in the data folder (<c>atlas-abr/</c>) and are redone only when a file changes.
+/// Subtitles go where Jellyfin caches extracted subtitles anyway; extracting them reads the whole
+/// file, which at play time held a movie on "loading" for over a minute.
 /// Runs nightly next to the trickplay and chapter image tasks.
 /// </remarks>
 public class AtlasKeyframeAnalysisTask : IScheduledTask, IConfigurableScheduledTask
@@ -35,6 +38,7 @@ public class AtlasKeyframeAnalysisTask : IScheduledTask, IConfigurableScheduledT
     private readonly ILibraryManager _libraryManager;
     private readonly IMediaEncoder _mediaEncoder;
     private readonly IApplicationPaths _applicationPaths;
+    private readonly ISubtitleEncoder _subtitleEncoder;
     private readonly ILogger<AtlasKeyframeAnalysisTask> _logger;
 
     /// <summary>
@@ -43,16 +47,19 @@ public class AtlasKeyframeAnalysisTask : IScheduledTask, IConfigurableScheduledT
     /// <param name="libraryManager">The library manager.</param>
     /// <param name="mediaEncoder">The media encoder (for the ffprobe path).</param>
     /// <param name="applicationPaths">The application paths.</param>
+    /// <param name="subtitleEncoder">The subtitle encoder (for extracting embedded subtitles).</param>
     /// <param name="logger">The logger.</param>
     public AtlasKeyframeAnalysisTask(
         ILibraryManager libraryManager,
         IMediaEncoder mediaEncoder,
         IApplicationPaths applicationPaths,
+        ISubtitleEncoder subtitleEncoder,
         ILogger<AtlasKeyframeAnalysisTask> logger)
     {
         _libraryManager = libraryManager;
         _mediaEncoder = mediaEncoder;
         _applicationPaths = applicationPaths;
+        _subtitleEncoder = subtitleEncoder;
         _logger = logger;
     }
 
@@ -63,7 +70,7 @@ public class AtlasKeyframeAnalysisTask : IScheduledTask, IConfigurableScheduledT
     public string Key => "AtlasKeyframeAnalysis";
 
     /// <inheritdoc />
-    public string Description => "Reads each video's keyframes and bitrate peaks once, so adaptive streaming can start instantly and offer the original file as the top quality.";
+    public string Description => "Reads each video's keyframes and bitrate peaks once and extracts its embedded subtitles, so adaptive streaming can start instantly and offer the original file as the top quality.";
 
     /// <inheritdoc />
     public string Category => "Atlas";
@@ -145,6 +152,12 @@ public class AtlasKeyframeAnalysisTask : IScheduledTask, IConfigurableScheduledT
                                 cancellationToken).ConfigureAwait(false))
                         {
                             analyzed++;
+                        }
+
+                        // Embedded subtitles: Jellyfin skips the ones it already extracted.
+                        if (source.MediaStreams?.Any(s => s is { IsExtractableSubtitleStream: true, IsExternal: false }) == true)
+                        {
+                            await _subtitleEncoder.ExtractAllExtractableSubtitles(source, cancellationToken).ConfigureAwait(false);
                         }
                     }
                 }

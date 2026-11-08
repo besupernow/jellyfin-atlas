@@ -8,12 +8,12 @@ namespace MediaBrowser.Controller.Streaming;
 /// Atlas: runs a process in macOS's background band (low CPU priority and throttled disk I/O).
 /// </summary>
 /// <remarks>
-/// Extracting embedded subtitles or analyzing keyframes reads the whole file as fast as the drive
-/// allows. On a spinning external drive that starves a transcode reading the same disk: a movie
-/// sat at "loading" for over a minute while its subtitles were extracted. In the background band
-/// macOS serves those reads only when nothing more important wants the disk, so the transcode goes
-/// first and the subtitles arrive a little later. Elsewhere (or with <c>ATLAS_BACKGROUND_READS=false</c>)
-/// nothing changes.
+/// Analyzing a file's keyframes reads all of it as fast as the drive allows. On a spinning external
+/// drive that starves a transcode reading the same disk (the same thing held a movie on "loading"
+/// for over a minute while Jellyfin extracted its subtitles). The first play of a file that hasn't
+/// been analyzed yet does exactly that: transcode and analysis at once. In the background band
+/// macOS serves the analysis's reads only when nothing more important wants the disk, so the
+/// transcode goes first. Elsewhere (or with <c>ATLAS_BACKGROUND_READS=false</c>) nothing changes.
 /// </remarks>
 public static class AtlasBackgroundProcess
 {
