@@ -709,6 +709,19 @@ public class DynamicHlsHelper
         var segments = includeOriginal ? AtlasAbrSettings.KeyframeSegments : AtlasAbrSettings.GridSegments;
         long sourceBitrate = info is { AverageVideoBitrate: > 0 } ? info.AverageVideoBitrate : videoStream.BitRate ?? 0;
         var levels = AtlasAbrLadder.Build(videoStream.Width ?? 0, videoStream.Height ?? 0, sourceBitrate, includeOriginal);
+
+        // A quality picked by hand in the app: just that one level, still on the Atlas grid and with
+        // sidecar subtitles (nothing burned in), instead of a separate classic transcode.
+        var request = _httpContextAccessor.HttpContext?.Request;
+        if (request is not null
+            && int.TryParse(request.Query[AtlasAbrSettings.MaxBitrateParameter], NumberStyles.Integer, CultureInfo.InvariantCulture, out var pinBitrate)
+            && int.TryParse(request.Query[AtlasAbrSettings.MaxHeightParameter], NumberStyles.Integer, CultureInfo.InvariantCulture, out var pinHeight)
+            && pinBitrate > 0
+            && pinHeight > 0)
+        {
+            levels = AtlasAbrLadder.Pin(videoStream.Width ?? 0, videoStream.Height ?? 0, sourceBitrate, includeOriginal, pinHeight, pinBitrate);
+        }
+
         if (levels.Count == 0)
         {
             return;
@@ -729,6 +742,8 @@ public class DynamicHlsHelper
             query.Remove(AtlasAbrSettings.RequestParameter);
             query.Remove(AtlasAbrSettings.StartBitrateParameter);
             query.Remove(AtlasAbrSettings.StartTicksParameter);
+            query.Remove(AtlasAbrSettings.MaxBitrateParameter);
+            query.Remove(AtlasAbrSettings.MaxHeightParameter);
             query[AtlasAbrSettings.LevelParameter] = level.Id;
             query[AtlasAbrSettings.SegmentsParameter] = segments;
             query["SegmentLength"] = grid.ToString(CultureInfo.InvariantCulture);
@@ -810,68 +825,45 @@ public class DynamicHlsHelper
             }
         }
 
-        StartAtlasPrewarm(state, variantQueries[startIndex], segments, info);
+        var session = StoreAtlasSession(state, levels, variantQueries, segments, info);
+        if (session is not null && AtlasAbrSettings.Prewarm)
+        {
+            // Start the start level's first segment now (see FetchAtlasSegment).
+            _ = long.TryParse(request?.Query[AtlasAbrSettings.StartTicksParameter].ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var startTicks);
+            FetchAtlasSegment(session, startIndex, session.SegmentAt(startTicks), warm: false);
+        }
     }
 
     /// <summary>
-    /// Starts transcoding the start level's first segment as soon as the master playlist is handed out,
-    /// instead of when the player gets round to asking for it (after the variant playlist, and for fMP4
-    /// the init segment). That overlaps transcoder startup with those round trips.
+    /// Remembers a session's ladder (level ids, variant queries, segment boundaries, the player's
+    /// credentials) so segment requests can get the next level up transcoding ahead of a switch.
     /// </summary>
-    /// <remarks>
-    /// The segment is requested from this server over the local address, exactly as the player will ask
-    /// for it (same query, user agent and credentials), so it goes through the normal path and lands in
-    /// the same transcode job: when the player's request arrives, the job is running or the segment is
-    /// waiting. Fire and forget; a failure only loses the head start. Atlas requests only.
-    /// </remarks>
     /// <param name="state">StreamState of the master request.</param>
-    /// <param name="variantQuery">The start level's variant query string.</param>
+    /// <param name="levels">The ladder, lowest first.</param>
+    /// <param name="variantQueries">Each level's variant query string.</param>
     /// <param name="segments">The segment boundary mode (keyframes or grid).</param>
     /// <param name="info">The source analysis, if any.</param>
-    private void StartAtlasPrewarm(StreamState state, string variantQuery, string segments, AtlasSourceInfo? info)
+    /// <returns>The stored session, or <c>null</c> if it can't be warmed (no session id, no runtime).</returns>
+    private AtlasSessionLadder? StoreAtlasSession(StreamState state, IReadOnlyList<AtlasAbrLevel> levels, List<string> variantQueries, string segments, AtlasSourceInfo? info)
     {
         var request = _httpContextAccessor.HttpContext?.Request;
         var runtimeTicks = state.RunTimeTicks ?? 0;
-        if (!AtlasAbrSettings.Prewarm || request is null || runtimeTicks <= 0)
+        var playSessionId = state.Request.PlaySessionId;
+        if (request is null || runtimeTicks <= 0 || string.IsNullOrEmpty(playSessionId))
         {
-            return;
+            return null;
         }
 
-        var grid = AtlasAbrSettings.GridSeconds;
         var lengths = string.Equals(segments, AtlasAbrSettings.KeyframeSegments, StringComparison.Ordinal) && info is { Aligned: true, KeyframeSeconds.Count: > 0 }
             ? AtlasSegmentGrid.FromKeyframes(info.KeyframeSeconds, runtimeTicks)
-            : AtlasSegmentGrid.FromGrid(runtimeTicks, grid, AtlasSegmentGrid.GetFrameRate(state.VideoStream));
+            : AtlasSegmentGrid.FromGrid(runtimeTicks, AtlasAbrSettings.GridSeconds, AtlasSegmentGrid.GetFrameRate(state.VideoStream));
         if (lengths.Count == 0)
         {
-            return;
+            return null;
         }
 
-        // The segment holding the start position, with the same tick arithmetic as the playlist
-        // generator, so runtimeTicks/actualSegmentLengthTicks match what the player will send.
-        _ = long.TryParse(request.Query[AtlasAbrSettings.StartTicksParameter], NumberStyles.Integer, CultureInfo.InvariantCulture, out var startTicks);
-        var index = 0;
-        long segmentStart = 0;
-        long segmentLength = Convert.ToInt64(lengths[0] * TimeSpan.TicksPerSecond);
-        for (var i = 0; i < lengths.Count; i++)
-        {
-            var length = Convert.ToInt64(lengths[i] * TimeSpan.TicksPerSecond);
-            if (segmentStart + length > startTicks || i == lengths.Count - 1)
-            {
-                index = i;
-                segmentLength = length;
-                break;
-            }
-
-            segmentStart += length;
-        }
-
-        var container = string.IsNullOrEmpty(state.Request.SegmentContainer) ? "ts" : state.Request.SegmentContainer;
-        var url = string.Create(
-            CultureInfo.InvariantCulture,
-            $"{_serverApplicationHost.GetApiUrlForLocalAccess(null, false).TrimEnd('/')}/Videos/{state.Request.Id:N}/hls1/main/{index}.{container}?{variantQuery}&runtimeTicks={segmentStart}&actualSegmentLengthTicks={segmentLength}");
-
-        // Same credentials and user agent as the player: the user agent is part of the transcode
-        // job's identity, so anything else would start a second job.
+        // Same credentials and user agent as the player: the user agent is part of a transcode job's
+        // identity, so anything else would start a second job instead of filling the player's.
         var headers = new List<KeyValuePair<string, string>>();
         foreach (var name in new[] { HeaderNames.Authorization, "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token", HeaderNames.UserAgent })
         {
@@ -881,6 +873,68 @@ public class DynamicHlsHelper
                 headers.Add(new KeyValuePair<string, string>(name, value));
             }
         }
+
+        var session = new AtlasSessionLadder(
+            state.Request.Id.ToString("N", CultureInfo.InvariantCulture),
+            string.IsNullOrEmpty(state.Request.SegmentContainer) ? "ts" : state.Request.SegmentContainer,
+            levels.Select(l => l.Id).ToArray(),
+            levels.Select(l => l.IsOriginal).ToArray(),
+            variantQueries.ToArray(),
+            lengths,
+            headers);
+        AtlasSessionLadder.Store(playSessionId, session);
+        return session;
+    }
+
+    /// <summary>
+    /// Atlas ABR: called when the player has been served a segment of a level. Gets the next level up
+    /// transcoding from the following segment, so when the player steps up, that level's segments are
+    /// ready (or nearly) instead of a transcoder starting from cold while the buffer drains. The original
+    /// (a stream copy) starts instantly, so it is never warmed.
+    /// </summary>
+    /// <param name="playSessionId">The play session id.</param>
+    /// <param name="level">The level that was served.</param>
+    /// <param name="segmentIndex">The segment that was served.</param>
+    public void WarmNextAtlasLevel(string? playSessionId, string level, int segmentIndex)
+    {
+        if (!AtlasAbrSettings.Prewarm || string.IsNullOrEmpty(playSessionId) || !AtlasSessionLadder.TryGet(playSessionId, out var session))
+        {
+            return;
+        }
+
+        var index = Array.IndexOf(session.LevelIds, level);
+        var next = index + 1;
+        if (index < 0 || next >= session.LevelIds.Length || session.IsOriginal[next] || segmentIndex + 1 >= session.SegmentCount)
+        {
+            return;
+        }
+
+        var nextLevel = session.LevelIds[next];
+        if (_transcodeManager.HasAtlasLevelJob(playSessionId, nextLevel) || !session.TryClaimWarm(nextLevel))
+        {
+            return;
+        }
+
+        _ = _transcodeManager.KillAtlasWarmJobs(playSessionId, nextLevel);
+        FetchAtlasSegment(session, next, segmentIndex + 1, warm: true);
+    }
+
+    /// <summary>
+    /// Requests a segment of a level from this server over its local address, exactly as the player
+    /// would (same query, user agent and credentials), so it goes through the normal path and lands in
+    /// the same transcode job the player will use. Fire and forget: a failure only loses the head start.
+    /// </summary>
+    /// <param name="session">The session's ladder.</param>
+    /// <param name="levelIndex">The level.</param>
+    /// <param name="segmentIndex">The segment.</param>
+    /// <param name="warm">Whether this warms a level the player isn't on yet.</param>
+    private void FetchAtlasSegment(AtlasSessionLadder session, int levelIndex, int segmentIndex, bool warm)
+    {
+        var url = string.Create(
+            CultureInfo.InvariantCulture,
+            $"{_serverApplicationHost.GetApiUrlForLocalAccess(null, false).TrimEnd('/')}/Videos/{session.ItemId}/hls1/main/{segmentIndex}.{session.Container}?{session.Queries[levelIndex]}&runtimeTicks={session.SegmentStartTicks[segmentIndex]}&actualSegmentLengthTicks={session.SegmentLengthTicks[segmentIndex]}{(warm ? "&" + AtlasAbrSettings.WarmParameter + "=1" : string.Empty)}");
+        var headers = session.Headers;
+        var levelId = session.LevelIds[levelIndex];
 
         _ = Task.Run(async () =>
         {
@@ -895,11 +949,11 @@ public class DynamicHlsHelper
 
                 var client = _httpClientFactory.CreateClient(NamedClient.Default);
                 using var response = await client.SendAsync(message, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
-                _logger.LogDebug("Atlas ABR: prewarmed segment {Index} ({Status})", index, (int)response.StatusCode);
+                _logger.LogDebug("Atlas ABR: {Kind} {Level} segment {Index} ({Status})", warm ? "warmed" : "prewarmed", levelId, segmentIndex, (int)response.StatusCode);
             }
             catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or InvalidOperationException)
             {
-                _logger.LogDebug(ex, "Atlas ABR: start segment prewarm failed");
+                _logger.LogDebug(ex, "Atlas ABR: fetching {Level} segment {Index} ahead failed", levelId, segmentIndex);
             }
         });
     }

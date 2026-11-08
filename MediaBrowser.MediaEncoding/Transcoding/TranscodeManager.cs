@@ -33,6 +33,11 @@ namespace MediaBrowser.MediaEncoding.Transcoding;
 /// <inheritdoc cref="ITranscodeManager"/>
 public sealed class TranscodeManager : ITranscodeManager, IDisposable
 {
+    /// <summary>
+    /// How long an Atlas ABR warm-up level is kept running without the player coming to it.
+    /// </summary>
+    private static readonly TimeSpan _atlasWarmLifetime = TimeSpan.FromSeconds(120);
+
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<TranscodeManager> _logger;
     private readonly IFileSystem _fileSystem;
@@ -142,9 +147,12 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
             }
         }
 
+        // A warm-up level (started for the player to switch up to) stays pinged for a while too;
+        // if the player hasn't come to it by then it times out, and the next one starts fresh.
         jobs.RemoveAll(j => !string.IsNullOrEmpty(j.AtlasLevel)
             && j.AtlasLastActivityUtc < latestAtlasActivity
-            && AtlasAbrSettings.IsIdle(j.AtlasLastActivityUtc, now));
+            && AtlasAbrSettings.IsIdle(j.AtlasLastActivityUtc, now)
+            && !(j.AtlasWarm && (now - j.AtlasLastActivityUtc) < _atlasWarmLifetime));
 
         foreach (var job in jobs)
         {
@@ -246,17 +254,19 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
     }
 
     /// <inheritdoc />
-    public Task OnAtlasLevelSegmentServed(TranscodingJob job)
+    public Task OnAtlasLevelSegmentServed(TranscodingJob job, bool warmRequest)
     {
         ArgumentNullException.ThrowIfNull(job);
 
-        if (string.IsNullOrEmpty(job.AtlasLevel) || string.IsNullOrEmpty(job.PlaySessionId))
+        if (string.IsNullOrEmpty(job.AtlasLevel) || string.IsNullOrEmpty(job.PlaySessionId) || warmRequest)
         {
+            // The warm-up's own request says nothing about what the player is watching.
             return Task.CompletedTask;
         }
 
         var now = DateTime.UtcNow;
         job.AtlasLastActivityUtc = now;
+        job.AtlasWarm = false;
 
         // The level that just served a segment is the one being watched. Stop the session's other
         // levels once nothing has asked them for a segment in a while, so a level the player only
@@ -267,9 +277,30 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
                 && string.Equals(other.PlaySessionId, job.PlaySessionId, StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(other.AtlasLevel, job.AtlasLevel, StringComparison.Ordinal)
                 && other.ActiveRequestCount <= 0
-                && AtlasAbrSettings.IsIdle(other.AtlasLastActivityUtc, now),
+                && AtlasAbrSettings.IsIdle(other.AtlasLastActivityUtc, now)
+                && !(other.AtlasWarm && (now - other.AtlasLastActivityUtc) < _atlasWarmLifetime),
             _ => true);
     }
+
+    /// <inheritdoc />
+    public bool HasAtlasLevelJob(string playSessionId, string level)
+    {
+        lock (_activeTranscodingJobs)
+        {
+            return _activeTranscodingJobs.Any(j => string.Equals(j.PlaySessionId, playSessionId, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(j.AtlasLevel, level, StringComparison.Ordinal)
+                && !j.HasExited);
+        }
+    }
+
+    /// <inheritdoc />
+    public Task KillAtlasWarmJobs(string playSessionId, string keepLevel)
+        => KillTranscodingJobs(
+            j => j.AtlasWarm
+                && string.Equals(j.PlaySessionId, playSessionId, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(j.AtlasLevel, keepLevel, StringComparison.Ordinal)
+                && j.ActiveRequestCount <= 0,
+            _ => true);
 
     private async Task KillTranscodingJob(TranscodingJob job, bool closeLiveStream, Func<string, bool> delete)
     {
@@ -656,7 +687,8 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
                 LiveStreamId = liveStreamId,
                 MediaSource = state.MediaSource,
                 AtlasLevel = state.AtlasLevel,
-                AtlasLastActivityUtc = DateTime.UtcNow
+                AtlasLastActivityUtc = DateTime.UtcNow,
+                AtlasWarm = state.AtlasWarm
             };
 
             _activeTranscodingJobs.Add(job);

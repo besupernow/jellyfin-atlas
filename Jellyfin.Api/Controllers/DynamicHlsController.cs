@@ -2122,6 +2122,10 @@ public class DynamicHlsController : BaseJellyfinApiController
     {
         var segmentEndingPositionTicks = state.Request.CurrentRuntimeTicks + state.Request.ActualSegmentLengthTicks;
 
+        // Read now: the state is disposed by the time the response completes.
+        var atlasLevel = state.IsAtlasLevel ? state.AtlasLevel : null;
+        var atlasWarm = state.AtlasWarm;
+        var atlasPlaySessionId = state.Request.PlaySessionId;
         Response.OnCompleted(() =>
         {
             _logger.LogDebug("Finished serving {SegmentPath}", segmentPath);
@@ -2131,10 +2135,16 @@ public class DynamicHlsController : BaseJellyfinApiController
                 transcodingJob.ReportSegmentDownloaded(segmentIndex, segmentEndingPositionTicks);
                 _transcodeManager.OnTranscodeEndRequest(transcodingJob);
 
-                // Atlas ABR: this level is the one being watched; stop levels the player has left.
-                if (state.IsAtlasLevel)
+                // Atlas ABR: this level is the one being watched; stop levels the player has left,
+                // and get the next level up transcoding so a switch to it doesn't stall.
+                if (atlasLevel is not null)
                 {
-                    return _transcodeManager.OnAtlasLevelSegmentServed(transcodingJob);
+                    if (!atlasWarm)
+                    {
+                        _dynamicHlsHelper.WarmNextAtlasLevel(atlasPlaySessionId, atlasLevel, segmentIndex);
+                    }
+
+                    return _transcodeManager.OnAtlasLevelSegmentServed(transcodingJob, atlasWarm);
                 }
             }
 

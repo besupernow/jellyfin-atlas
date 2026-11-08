@@ -265,6 +265,7 @@ public static class StreamingHelpers
                 httpRequest.Query[AtlasAbrSettings.SegmentsParameter].ToString(),
                 AtlasAbrSettings.KeyframeSegments,
                 StringComparison.Ordinal);
+            state.AtlasWarm = string.Equals(httpRequest.Query[AtlasAbrSettings.WarmParameter].ToString(), "1", StringComparison.Ordinal);
         }
 
         state.OutputFilePath = GetOutputFilePath(state, ext, serverConfigurationManager, streamingRequest.DeviceId, streamingRequest.PlaySessionId);
