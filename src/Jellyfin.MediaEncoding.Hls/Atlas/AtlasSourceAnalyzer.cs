@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Common.Configuration;
+using MediaBrowser.Controller.Streaming;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.MediaEncoding.Hls.Atlas;
@@ -224,6 +225,8 @@ internal static class AtlasSourceAnalyzer
             process.StartInfo.ArgumentList.Add(arg);
         }
 
+        // Reads the whole file: on macOS, also yield the disk to transcodes, not just the CPU.
+        AtlasBackgroundProcess.Apply(process.StartInfo);
         process.Start();
         try
         {
