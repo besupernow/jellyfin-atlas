@@ -56,7 +56,7 @@ public static class AtlasAbrSettings
     public const string MaxHeightParameter = "AtlasMaxHeight";
 
     /// <summary>
-    /// The segment query parameter marking the server's own warm-up request for the next level up, so
+    /// The segment query parameter marking the server's own warm-up request for a level the player asked to switch to, so
     /// that level is already transcoding when the player switches to it.
     /// </summary>
     public const string WarmParameter = "AtlasWarm";
@@ -107,7 +107,13 @@ public static class AtlasAbrSettings
     /// <summary>
     /// Gets how long a quality level may go without segment requests before it is stopped, in seconds.
     /// </summary>
-    public static int IdleLevelSeconds { get; } = ReadInt("ATLAS_ABR_IDLE_LEVEL_SECONDS", 20, 5, 600);
+    public static int IdleLevelSeconds { get; } = ReadInt("ATLAS_ABR_IDLE_LEVEL_SECONDS", 10, 5, 600);
+
+    /// <summary>
+    /// Gets how many segments past the player's next one must be on disk before a warmed-up level
+    /// counts as ready to switch to.
+    /// </summary>
+    public static int WarmReadySegments { get; } = ReadInt("ATLAS_ABR_WARM_READY_SEGMENTS", 2, 1, 10);
 
     /// <summary>
     /// Gets the peak/average bitrate ratio assumed for an original file that hasn't been analyzed yet.

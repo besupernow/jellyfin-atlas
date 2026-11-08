@@ -8,18 +8,19 @@ namespace Jellyfin.Api.Helpers;
 
 /// <summary>
 /// Atlas ABR: what a playback session's master playlist handed out (level ids, each level's variant
-/// query, the segment boundaries and the player's credentials), kept so segment requests can fetch
-/// ahead on the player's behalf: the start segment at playlist time, and the next level up while the
-/// player is still on the one below.
+/// query, the segment boundaries and the player's credentials), kept so the server can fetch ahead
+/// on the player's behalf: the start segment at playlist time, and a level the player asked to have
+/// warmed up before it switches to it.
 /// </summary>
 internal sealed class AtlasSessionLadder
 {
     private static readonly ConcurrentDictionary<string, AtlasSessionLadder> _sessions = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan _lifetime = TimeSpan.FromHours(12);
-    private static readonly TimeSpan _warmRetry = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan _warmRestartInterval = TimeSpan.FromSeconds(5);
 
     private readonly Lock _warmLock = new();
     private string? _warmLevel;
+    private int _warmStartSegment;
     private DateTime _warmAtUtc;
 
     /// <summary>
@@ -140,24 +141,42 @@ internal sealed class AtlasSessionLadder
     }
 
     /// <summary>
-    /// Claims the right to warm <paramref name="level"/>. Each segment the player fetches would ask
-    /// again; this keeps it to one warm-up per level at a time (retried after a while if the job died).
+    /// Records that a warm-up of <paramref name="level"/> starts at <paramref name="segment"/>. The
+    /// player asks about once a second; this keeps it to one (re)start of a level every few seconds.
     /// </summary>
     /// <param name="level">The level to warm.</param>
+    /// <param name="segment">The segment it starts at.</param>
     /// <returns><c>true</c> if the caller should start it.</returns>
-    public bool TryClaimWarm(string level)
+    public bool TryStartWarm(string level, int segment)
     {
         lock (_warmLock)
         {
             var now = DateTime.UtcNow;
-            if (string.Equals(_warmLevel, level, StringComparison.Ordinal) && now - _warmAtUtc < _warmRetry)
+            if (string.Equals(_warmLevel, level, StringComparison.Ordinal) && now - _warmAtUtc < _warmRestartInterval)
             {
                 return false;
             }
 
             _warmLevel = level;
+            _warmStartSegment = segment;
             _warmAtUtc = now;
             return true;
         }
     }
+
+    /// <summary>
+    /// Gets where the warm-up of <paramref name="level"/> started, if it is the one last started.
+    /// </summary>
+    /// <param name="level">The level.</param>
+    /// <param name="startSegment">The segment it started at.</param>
+    /// <returns><c>true</c> if <paramref name="level"/> is the level last warmed.</returns>
+    public bool TryGetWarmStart(string level, out int startSegment)
+    {
+        lock (_warmLock)
+        {
+            startSegment = _warmStartSegment;
+            return string.Equals(_warmLevel, level, StringComparison.Ordinal);
+        }
+    }
+
 }

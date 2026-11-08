@@ -693,6 +693,44 @@ public class DynamicHlsController : BaseJellyfinApiController
     }
 
     /// <summary>
+    /// Atlas ABR: asks for a quality level to be warmed up before the player switches to it.
+    /// </summary>
+    /// <remarks>
+    /// The player calls this about once a second while it wants to step up. The first call starts
+    /// that level transcoding from <paramref name="segment"/>; once the next few segments are on disk
+    /// the answer is ready and the player switches. A warm-up nobody keeps asking about stops itself.
+    /// </remarks>
+    /// <param name="itemId">The item id.</param>
+    /// <param name="playSessionId">The play session id of the Atlas master playlist.</param>
+    /// <param name="level">The level id, from the variant's AtlasLevel parameter.</param>
+    /// <param name="segment">The next segment the player would fetch.</param>
+    /// <response code="200">Whether the level is ready to switch to.</response>
+    /// <response code="404">Unknown session or level.</response>
+    /// <returns>An <see cref="AtlasWarmResult"/>.</returns>
+    [HttpPost("Videos/{itemId}/AtlasWarm")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public ActionResult<AtlasWarmResult> WarmAtlasLevel(
+        [FromRoute, Required] Guid itemId,
+        [FromQuery, Required] string playSessionId,
+        [FromQuery, Required] string level,
+        [FromQuery, Required] int segment)
+    {
+        if (!AtlasAbrSettings.IsValidLevel(level))
+        {
+            return NotFound();
+        }
+
+        var ready = _dynamicHlsHelper.WarmAtlasLevel(itemId.ToString("N", CultureInfo.InvariantCulture), playSessionId, level, segment);
+        if (ready is null)
+        {
+            return NotFound();
+        }
+
+        return new AtlasWarmResult { Ready = ready.Value };
+    }
+
+    /// <summary>
     /// Gets a video stream using HTTP live streaming.
     /// </summary>
     /// <param name="itemId">The item id.</param>
@@ -2125,7 +2163,6 @@ public class DynamicHlsController : BaseJellyfinApiController
         // Read now: the state is disposed by the time the response completes.
         var atlasLevel = state.IsAtlasLevel ? state.AtlasLevel : null;
         var atlasWarm = state.AtlasWarm;
-        var atlasPlaySessionId = state.Request.PlaySessionId;
         Response.OnCompleted(() =>
         {
             _logger.LogDebug("Finished serving {SegmentPath}", segmentPath);
@@ -2135,15 +2172,9 @@ public class DynamicHlsController : BaseJellyfinApiController
                 transcodingJob.ReportSegmentDownloaded(segmentIndex, segmentEndingPositionTicks);
                 _transcodeManager.OnTranscodeEndRequest(transcodingJob);
 
-                // Atlas ABR: this level is the one being watched; stop levels the player has left,
-                // and get the next level up transcoding so a switch to it doesn't stall.
+                // Atlas ABR: this level is the one being watched; stop levels the player has left.
                 if (atlasLevel is not null)
                 {
-                    if (!atlasWarm)
-                    {
-                        _dynamicHlsHelper.WarmNextAtlasLevel(atlasPlaySessionId, atlasLevel, segmentIndex);
-                    }
-
                     return _transcodeManager.OnAtlasLevelSegmentServed(transcodingJob, atlasWarm);
                 }
             }
