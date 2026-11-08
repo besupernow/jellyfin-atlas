@@ -233,6 +233,14 @@ jobs:
             security import "$RUNNER_TEMP/atlas-signing.p12" -k "$KC" -P "$SIGNING_PASSWORD" -T /usr/bin/codesign
             rm -f "$RUNNER_TEMP/atlas-signing.p12"
             security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k atlas "$KC" > /dev/null
+            # codesign only finds an identity in a keychain on the search list, --keychain or not.
+            security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+            # Trust the self-signed cert for code signing on this runner, so codesign can build its
+            # chain. (Only this throwaway runner; the Mac never needs to trust it.)
+            security find-certificate -c "Atlas Server Signing" -p "$KC" > "$RUNNER_TEMP/atlas-signing.pem"
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+              -k /Library/Keychains/System.keychain "$RUNNER_TEMP/atlas-signing.pem" \
+              || echo "::warning::Couldn't mark the signing cert trusted; trying to sign anyway"
             # Self-signed, so not "valid" (-v would hide it); its SHA-1 is all codesign needs.
             IDENTITY=$(security find-identity -p codesigning "$KC" | awk '/^ *[0-9]+\)/ {print $2; exit}')
             [ -n "$IDENTITY" ] || { echo "::error::No code signing identity in ATLAS_SIGNING_P12"; security find-identity "$KC"; exit 1; }
