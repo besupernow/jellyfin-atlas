@@ -889,7 +889,7 @@ public class DynamicHlsHelper
 
     /// <summary>
     /// Atlas ABR: the player wants to switch up to <paramref name="level"/> and would fetch
-    /// <paramref name="segment"/> next. Makes sure that level is transcoding from there (starting a
+    /// <paramref name="segmentIndex"/> next (or play from <paramref name="positionTicks"/>). Makes sure that level is transcoding from there (starting a
     /// warm-up when it isn't) and says whether it is far enough ahead to switch to now.
     /// </summary>
     /// <remarks>
@@ -900,9 +900,10 @@ public class DynamicHlsHelper
     /// <param name="itemId">The item id (N format).</param>
     /// <param name="playSessionId">The play session id.</param>
     /// <param name="level">The level to switch to.</param>
-    /// <param name="segment">The next segment the player would fetch.</param>
+    /// <param name="segmentIndex">The next segment the player would fetch.</param>
+    /// <param name="positionTicks">Or the position to warm from, when the player only knows times.</param>
     /// <returns><c>true</c> if ready, <c>false</c> if warming, <c>null</c> if the session or level is unknown.</returns>
-    public bool? WarmAtlasLevel(string itemId, string playSessionId, string level, int segment)
+    public bool? WarmAtlasLevel(string itemId, string playSessionId, string level, int? segmentIndex, long? positionTicks)
     {
         if (!AtlasAbrSettings.Enabled
             || !AtlasSessionLadder.TryGet(playSessionId, out var session)
@@ -917,6 +918,7 @@ public class DynamicHlsHelper
             return null;
         }
 
+        var segment = segmentIndex ?? session.SegmentAt(Math.Max(0, positionTicks ?? 0));
         if (segment < 0 || segment >= session.SegmentCount)
         {
             return false;

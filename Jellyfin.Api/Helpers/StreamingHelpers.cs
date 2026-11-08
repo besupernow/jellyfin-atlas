@@ -392,9 +392,12 @@ public static class StreamingHelpers
         var data = $"{state.MediaPath}-{state.UserAgent}-{deviceId!}-{playSessionId!}";
 
         // Atlas ABR: one folder per quality level, so levels never write over each other's segments.
+        // The user agent is left out: the play session already makes it unique, and a player whose
+        // segment downloader sends a different user agent than its playlist request (GStreamer,
+        // AVPlayer) would otherwise land in a different job than the one warmed up for it.
         if (state.IsAtlasLevel)
         {
-            data += "-atlas-" + state.AtlasLevel;
+            data = $"{state.MediaPath}-{deviceId!}-{playSessionId!}-atlas-{state.AtlasLevel}";
         }
 
         var filename = data.GetMD5().ToString("N", CultureInfo.InvariantCulture);
