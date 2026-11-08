@@ -14,6 +14,7 @@ namespace MediaBrowser.Controller.Streaming;
 /// without a settings UI:
 /// <list type="bullet">
 /// <item><c>ATLAS_ABR_ENABLED</c>: <c>false</c> turns the ladder off server-wide (default <c>true</c>).</item>
+/// <item><c>ATLAS_ABR_PREWARM</c>: <c>false</c> stops starting the first segment's transcode at playlist time (default <c>true</c>).</item>
 /// <item><c>ATLAS_ABR_GRID_SECONDS</c>: the keyframe interval the library was conformed to, and the segment length (default 2).</item>
 /// <item><c>ATLAS_ABR_IDLE_LEVEL_SECONDS</c>: how long a quality level may go without segment requests before it is stopped (default 20).</item>
 /// <item><c>ATLAS_ABR_PEAK_FACTOR</c>: peak/average bitrate ratio assumed for the original file until it has been analyzed (default 1.8).</item>
@@ -36,6 +37,12 @@ public static class AtlasAbrSettings
     /// The master playlist query parameter with the client's expected bandwidth, in bits per second.
     /// </summary>
     public const string StartBitrateParameter = "AtlasStartBitrate";
+
+    /// <summary>
+    /// The master playlist query parameter with where playback will start, in ticks, so the server can
+    /// start transcoding that segment right away (see <see cref="Prewarm"/>).
+    /// </summary>
+    public const string StartTicksParameter = "AtlasStartTicks";
 
     /// <summary>
     /// The variant playlist and segment query parameter saying where segment boundaries come from:
@@ -68,6 +75,12 @@ public static class AtlasAbrSettings
     /// Gets a value indicating whether Atlas ABR is enabled on this server.
     /// </summary>
     public static bool Enabled { get; } = ReadBool("ATLAS_ABR_ENABLED", true);
+
+    /// <summary>
+    /// Gets a value indicating whether the start level's first segment starts transcoding as soon as
+    /// the master playlist is handed out (<c>ATLAS_ABR_PREWARM</c>, default <c>true</c>).
+    /// </summary>
+    public static bool Prewarm { get; } = ReadBool("ATLAS_ABR_PREWARM", true);
 
     /// <summary>
     /// Gets the keyframe grid of the conformed library, in seconds. This is also the segment length.

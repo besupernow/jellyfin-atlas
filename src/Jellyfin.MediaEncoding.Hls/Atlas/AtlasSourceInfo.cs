@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 
-namespace Jellyfin.Api.Helpers;
+namespace Jellyfin.MediaEncoding.Hls.Atlas;
 
 /// <summary>
 /// What Atlas ABR knows about an original file, from one ffprobe pass over its video packets.

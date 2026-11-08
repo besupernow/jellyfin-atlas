@@ -14,6 +14,7 @@ using Jellyfin.Api.Helpers;
 using Jellyfin.Api.Models.StreamingDtos;
 using Jellyfin.Data.Enums;
 using Jellyfin.Extensions;
+using Jellyfin.MediaEncoding.Hls.Atlas;
 using Jellyfin.MediaEncoding.Hls.Playlist;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
@@ -1970,7 +1971,7 @@ public class DynamicHlsController : BaseJellyfinApiController
             var info = AtlasSourceAnalyzer.TryGetCached(
                 state.Request.MediaSourceId,
                 state.MediaPath,
-                Path.Combine(_serverConfigurationManager.ApplicationPaths.CachePath, "atlas-abr"),
+                AtlasSourceAnalyzer.GetDirectory(_serverConfigurationManager.ApplicationPaths),
                 state.SegmentLength);
             if (info is { Aligned: true, KeyframeSeconds.Count: > 0 })
             {

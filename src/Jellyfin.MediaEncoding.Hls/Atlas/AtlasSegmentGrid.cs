@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using MediaBrowser.Model.Entities;
 
-namespace Jellyfin.Api.Helpers;
+namespace Jellyfin.MediaEncoding.Hls.Atlas;
 
 /// <summary>
 /// Segment boundary math for Atlas ABR.

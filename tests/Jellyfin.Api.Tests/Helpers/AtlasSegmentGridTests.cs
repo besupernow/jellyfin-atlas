@@ -1,6 +1,6 @@
 ﻿using System;
 using System.Linq;
-using Jellyfin.Api.Helpers;
+using Jellyfin.MediaEncoding.Hls.Atlas;
 using Xunit;
 
 namespace Jellyfin.Api.Tests.Helpers

@@ -7,9 +7,10 @@ using System.IO;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using MediaBrowser.Common.Configuration;
 using Microsoft.Extensions.Logging;
 
-namespace Jellyfin.Api.Helpers;
+namespace Jellyfin.MediaEncoding.Hls.Atlas;
 
 /// <summary>
 /// Analyzes original files for Atlas ABR in the background and caches the result on disk.
@@ -27,6 +28,50 @@ internal static class AtlasSourceAnalyzer
     private static readonly TimeSpan _scanStartDelay = TimeSpan.FromSeconds(20);
     private static readonly JsonSerializerOptions _jsonOptions = new();
     private static readonly TimeSpan _scanTimeout = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Gets where analyses are stored: the data folder, not the cache, since redoing one means reading
+    /// the whole file again and "clear cache" shouldn't throw that away.
+    /// </summary>
+    /// <param name="paths">The application paths.</param>
+    /// <returns>The directory.</returns>
+    public static string GetDirectory(IApplicationPaths paths) => Path.Combine(paths.DataPath, "atlas-abr");
+
+    /// <summary>
+    /// Analyzes a file now unless a current analysis exists, waiting for any scan already running.
+    /// Used by the scheduled task, so playback never has to wait for one.
+    /// </summary>
+    /// <param name="mediaSourceId">The media source id.</param>
+    /// <param name="mediaPath">The file path.</param>
+    /// <param name="probePath">The ffprobe path.</param>
+    /// <param name="cacheDirectory">Where analyses are stored.</param>
+    /// <param name="gridSeconds">The grid to check keyframes against.</param>
+    /// <param name="logger">The logger.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns><c>true</c> if a scan ran, <c>false</c> if the file was already analyzed or can't be.</returns>
+    public static async Task<bool> AnalyzeIfNeededAsync(
+        string mediaSourceId,
+        string mediaPath,
+        string probePath,
+        string cacheDirectory,
+        int gridSeconds,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        if (TryGetCached(mediaSourceId, mediaPath, cacheDirectory, gridSeconds) is not null)
+        {
+            return false;
+        }
+
+        if (!_queued.TryAdd(mediaSourceId, 0))
+        {
+            // A playback already queued it.
+            return false;
+        }
+
+        await ScanAndStoreAsync(mediaSourceId, mediaPath, probePath, cacheDirectory, gridSeconds, logger, TimeSpan.Zero, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
 
     /// <summary>
     /// Gets the cached analysis of a file, queueing a scan if there is none (or the file changed).
@@ -48,7 +93,7 @@ internal static class AtlasSourceAnalyzer
 
         if (_queued.TryAdd(mediaSourceId, 0))
         {
-            _ = Task.Run(() => ScanAndStoreAsync(mediaSourceId, mediaPath, probePath, cacheDirectory, gridSeconds, logger));
+            _ = Task.Run(() => ScanAndStoreAsync(mediaSourceId, mediaPath, probePath, cacheDirectory, gridSeconds, logger, _scanStartDelay, CancellationToken.None));
         }
 
         return null;
@@ -87,12 +132,33 @@ internal static class AtlasSourceAnalyzer
             : null;
     }
 
-    private static async Task ScanAndStoreAsync(string mediaSourceId, string mediaPath, string probePath, string cacheDirectory, int gridSeconds, ILogger logger)
+    private static async Task ScanAndStoreAsync(
+        string mediaSourceId,
+        string mediaPath,
+        string probePath,
+        string cacheDirectory,
+        int gridSeconds,
+        ILogger logger,
+        TimeSpan startDelay,
+        CancellationToken cancellationToken)
     {
-        // Let the play that queued this get going first: the scan reads the whole file,
-        // and doing that while the first segments are being transcoded slows startup.
-        await Task.Delay(_scanStartDelay).ConfigureAwait(false);
-        await _scanGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            // A playback-triggered scan lets that play get going first: the scan reads the whole
+            // file, and doing that while the first segments are being transcoded slows startup.
+            if (startDelay > TimeSpan.Zero)
+            {
+                await Task.Delay(startDelay, cancellationToken).ConfigureAwait(false);
+            }
+
+            await _scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            _queued.TryRemove(mediaSourceId, out _);
+            throw;
+        }
+
         try
         {
             if (!TryGetFileStamp(mediaPath, out var size, out var lastWrite))
@@ -102,7 +168,7 @@ internal static class AtlasSourceAnalyzer
 
             logger.LogInformation("Atlas ABR: analyzing {Path}", mediaPath);
             var stopwatch = Stopwatch.StartNew();
-            var info = await ScanAsync(mediaPath, probePath, gridSeconds, size, lastWrite).ConfigureAwait(false);
+            var info = await ScanAsync(mediaPath, probePath, gridSeconds, size, lastWrite, cancellationToken).ConfigureAwait(false);
             if (info is null)
             {
                 return;
@@ -131,9 +197,10 @@ internal static class AtlasSourceAnalyzer
         }
     }
 
-    private static async Task<AtlasSourceInfo?> ScanAsync(string mediaPath, string probePath, int gridSeconds, long size, long lastWrite)
+    private static async Task<AtlasSourceInfo?> ScanAsync(string mediaPath, string probePath, int gridSeconds, long size, long lastWrite, CancellationToken cancellationToken)
     {
-        using var timeout = new CancellationTokenSource(_scanTimeout);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(_scanTimeout);
         using var process = new Process();
         process.StartInfo = new ProcessStartInfo
         {

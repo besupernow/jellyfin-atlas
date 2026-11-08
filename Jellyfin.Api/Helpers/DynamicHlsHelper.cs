@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Security.Claims;
 using System.Text;
 using System.Threading;
@@ -12,9 +13,11 @@ using Jellyfin.Api.Extensions;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Extensions;
+using Jellyfin.MediaEncoding.Hls.Atlas;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Common.Net;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
@@ -47,6 +50,8 @@ public class DynamicHlsHelper
     private readonly IHttpContextAccessor _httpContextAccessor;
     private readonly EncodingHelper _encodingHelper;
     private readonly ITrickplayManager _trickplayManager;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IServerApplicationHost _serverApplicationHost;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DynamicHlsHelper"/> class.
@@ -62,6 +67,8 @@ public class DynamicHlsHelper
     /// <param name="httpContextAccessor">Instance of the <see cref="IHttpContextAccessor"/> interface.</param>
     /// <param name="encodingHelper">Instance of <see cref="EncodingHelper"/>.</param>
     /// <param name="trickplayManager">Instance of <see cref="ITrickplayManager"/>.</param>
+    /// <param name="httpClientFactory">Instance of <see cref="IHttpClientFactory"/>, for the Atlas start segment prewarm.</param>
+    /// <param name="serverApplicationHost">Instance of <see cref="IServerApplicationHost"/>, for this server's local address.</param>
     public DynamicHlsHelper(
         ILibraryManager libraryManager,
         IUserManager userManager,
@@ -73,7 +80,9 @@ public class DynamicHlsHelper
         ILogger<DynamicHlsHelper> logger,
         IHttpContextAccessor httpContextAccessor,
         EncodingHelper encodingHelper,
-        ITrickplayManager trickplayManager)
+        ITrickplayManager trickplayManager,
+        IHttpClientFactory httpClientFactory,
+        IServerApplicationHost serverApplicationHost)
     {
         _libraryManager = libraryManager;
         _userManager = userManager;
@@ -86,6 +95,8 @@ public class DynamicHlsHelper
         _httpContextAccessor = httpContextAccessor;
         _encodingHelper = encodingHelper;
         _trickplayManager = trickplayManager;
+        _httpClientFactory = httpClientFactory;
+        _serverApplicationHost = serverApplicationHost;
     }
 
     /// <summary>
@@ -711,11 +722,13 @@ public class DynamicHlsHelper
         const double Overhead = 1.05;
 
         var variants = new List<(long Peak, string Text)>(levels.Count);
+        var variantQueries = new List<string>(levels.Count);
         foreach (var level in levels)
         {
             var query = new Dictionary<string, StringValues>(playlistQuery, StringComparer.OrdinalIgnoreCase);
             query.Remove(AtlasAbrSettings.RequestParameter);
             query.Remove(AtlasAbrSettings.StartBitrateParameter);
+            query.Remove(AtlasAbrSettings.StartTicksParameter);
             query[AtlasAbrSettings.LevelParameter] = level.Id;
             query[AtlasAbrSettings.SegmentsParameter] = segments;
             query["SegmentLength"] = grid.ToString(CultureInfo.InvariantCulture);
@@ -782,6 +795,7 @@ public class DynamicHlsHelper
             line.AppendLine();
             line.AppendLine(Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, query));
             variants.Add((peak, line.ToString()));
+            variantQueries.Add(Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(string.Empty, query).TrimStart('?'));
         }
 
         // The start level goes first (see GetAtlasStartIndex).
@@ -795,6 +809,99 @@ public class DynamicHlsHelper
                 builder.Append(variants[i].Text);
             }
         }
+
+        StartAtlasPrewarm(state, variantQueries[startIndex], segments, info);
+    }
+
+    /// <summary>
+    /// Starts transcoding the start level's first segment as soon as the master playlist is handed out,
+    /// instead of when the player gets round to asking for it (after the variant playlist, and for fMP4
+    /// the init segment). That overlaps transcoder startup with those round trips.
+    /// </summary>
+    /// <remarks>
+    /// The segment is requested from this server over the local address, exactly as the player will ask
+    /// for it (same query, user agent and credentials), so it goes through the normal path and lands in
+    /// the same transcode job: when the player's request arrives, the job is running or the segment is
+    /// waiting. Fire and forget; a failure only loses the head start. Atlas requests only.
+    /// </remarks>
+    /// <param name="state">StreamState of the master request.</param>
+    /// <param name="variantQuery">The start level's variant query string.</param>
+    /// <param name="segments">The segment boundary mode (keyframes or grid).</param>
+    /// <param name="info">The source analysis, if any.</param>
+    private void StartAtlasPrewarm(StreamState state, string variantQuery, string segments, AtlasSourceInfo? info)
+    {
+        var request = _httpContextAccessor.HttpContext?.Request;
+        var runtimeTicks = state.RunTimeTicks ?? 0;
+        if (!AtlasAbrSettings.Prewarm || request is null || runtimeTicks <= 0)
+        {
+            return;
+        }
+
+        var grid = AtlasAbrSettings.GridSeconds;
+        var lengths = string.Equals(segments, AtlasAbrSettings.KeyframeSegments, StringComparison.Ordinal) && info is { Aligned: true, KeyframeSeconds.Count: > 0 }
+            ? AtlasSegmentGrid.FromKeyframes(info.KeyframeSeconds, runtimeTicks)
+            : AtlasSegmentGrid.FromGrid(runtimeTicks, grid, AtlasSegmentGrid.GetFrameRate(state.VideoStream));
+        if (lengths.Count == 0)
+        {
+            return;
+        }
+
+        // The segment holding the start position, with the same tick arithmetic as the playlist
+        // generator, so runtimeTicks/actualSegmentLengthTicks match what the player will send.
+        _ = long.TryParse(request.Query[AtlasAbrSettings.StartTicksParameter], NumberStyles.Integer, CultureInfo.InvariantCulture, out var startTicks);
+        var index = 0;
+        long segmentStart = 0;
+        long segmentLength = Convert.ToInt64(lengths[0] * TimeSpan.TicksPerSecond);
+        for (var i = 0; i < lengths.Count; i++)
+        {
+            var length = Convert.ToInt64(lengths[i] * TimeSpan.TicksPerSecond);
+            if (segmentStart + length > startTicks || i == lengths.Count - 1)
+            {
+                index = i;
+                segmentLength = length;
+                break;
+            }
+
+            segmentStart += length;
+        }
+
+        var container = string.IsNullOrEmpty(state.Request.SegmentContainer) ? "ts" : state.Request.SegmentContainer;
+        var url = string.Create(
+            CultureInfo.InvariantCulture,
+            $"{_serverApplicationHost.GetApiUrlForLocalAccess(null, false).TrimEnd('/')}/Videos/{state.Request.Id:N}/hls1/main/{index}.{container}?{variantQuery}&runtimeTicks={segmentStart}&actualSegmentLengthTicks={segmentLength}");
+
+        // Same credentials and user agent as the player: the user agent is part of the transcode
+        // job's identity, so anything else would start a second job.
+        var headers = new List<KeyValuePair<string, string>>();
+        foreach (var name in new[] { HeaderNames.Authorization, "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token", HeaderNames.UserAgent })
+        {
+            var value = request.Headers[name].ToString();
+            if (!string.IsNullOrEmpty(value))
+            {
+                headers.Add(new KeyValuePair<string, string>(name, value));
+            }
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                using var message = new HttpRequestMessage(HttpMethod.Get, url);
+                foreach (var header in headers)
+                {
+                    message.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                }
+
+                var client = _httpClientFactory.CreateClient(NamedClient.Default);
+                using var response = await client.SendAsync(message, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
+                _logger.LogDebug("Atlas ABR: prewarmed segment {Index} ({Status})", index, (int)response.StatusCode);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or InvalidOperationException)
+            {
+                _logger.LogDebug(ex, "Atlas ABR: start segment prewarm failed");
+            }
+        });
     }
 
     private static int GetAtlasStartIndex(IReadOnlyList<AtlasAbrLevel> levels)
@@ -828,7 +935,7 @@ public class DynamicHlsHelper
     }
 
     private string GetAtlasCacheDirectory()
-        => System.IO.Path.Combine(_serverConfigurationManager.ApplicationPaths.CachePath, "atlas-abr");
+        => AtlasSourceAnalyzer.GetDirectory(_serverConfigurationManager.ApplicationPaths);
 
     private bool EnableAdaptiveBitrateStreaming(StreamState state, bool isLiveStream, bool enableAdaptiveBitrateStreaming, IPAddress ipAddress)
     {
