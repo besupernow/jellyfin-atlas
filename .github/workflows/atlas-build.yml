@@ -211,10 +211,36 @@ jobs:
             echo "ffmpeg=$(cat "$APP/Contents/Resources/ffmpeg/FFMPEG_ASSET")"
           } > "$APP/Contents/Resources/ATLAS_BUILD"
 
-      # No Apple Developer ID, so ad-hoc sign: Apple silicon won't run unsigned code at all.
+      # No Apple Developer ID. With the ATLAS_SIGNING_P12 secret (a self-signed code signing cert,
+      # see atlas/macos/README.md) every build is signed by the same identity, so macOS keeps the
+      # permissions it granted (removable volumes, Full Disk Access) across updates. Without it,
+      # ad-hoc: Apple silicon won't run unsigned code at all, but every build looks like a new app
+      # to macOS and it asks for those permissions again.
       # Every Mach-O gets its own signature first, then the app itself.
-      - name: Ad-hoc sign
+      - name: Sign
+        env:
+          SIGNING_P12: ${{ secrets.ATLAS_SIGNING_P12 }}
+          SIGNING_PASSWORD: ${{ secrets.ATLAS_SIGNING_PASSWORD }}
         run: |
+          IDENTITY=-
+          KEYCHAIN_ARGS=()
+          if [ -n "$SIGNING_P12" ]; then
+            KC="$RUNNER_TEMP/atlas-signing.keychain-db"
+            security create-keychain -p atlas "$KC"
+            security set-keychain-settings -lut 3600 "$KC"
+            security unlock-keychain -p atlas "$KC"
+            echo "$SIGNING_P12" | base64 --decode > "$RUNNER_TEMP/atlas-signing.p12"
+            security import "$RUNNER_TEMP/atlas-signing.p12" -k "$KC" -P "$SIGNING_PASSWORD" -T /usr/bin/codesign
+            rm -f "$RUNNER_TEMP/atlas-signing.p12"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k atlas "$KC" > /dev/null
+            # Self-signed, so not "valid" (-v would hide it); its SHA-1 is all codesign needs.
+            IDENTITY=$(security find-identity -p codesigning "$KC" | awk '/^ *[0-9]+\)/ {print $2; exit}')
+            [ -n "$IDENTITY" ] || { echo "::error::No code signing identity in ATLAS_SIGNING_P12"; security find-identity "$KC"; exit 1; }
+            KEYCHAIN_ARGS=(--keychain "$KC")
+            echo "Signing with the Atlas identity $IDENTITY"
+          else
+            echo "::warning::ATLAS_SIGNING_P12 not set: ad-hoc signing, macOS will ask for permissions again after this update"
+          fi
           # Collect first, then sign: signing inside the find pipe aborts find when codesign fails.
           machos=()
           while IFS= read -r -d '' f; do
@@ -223,10 +249,11 @@ jobs:
             fi
           done < <(find "$APP/Contents/Resources" -type f -print0)
           for f in "${machos[@]}"; do
-            codesign --force --sign - "$f"
+            codesign --force --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" "$f"
           done
-          codesign --force --sign - "$APP"
+          codesign --force --sign "$IDENTITY" "${KEYCHAIN_ARGS[@]}" --identifier com.besupernow.atlas.server "$APP"
           codesign --verify --verbose "$APP" || echo "::warning::codesign verify reported issues"
+          codesign --display --requirements - "$APP" || true
 
       - name: Make DMG
         run: |
