@@ -22,6 +22,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Streaming;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.IO;
@@ -891,6 +892,8 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 EnableRaisingEvents = true
             })
             {
+                // Atlas: this reads the whole file; let a transcode of it have the disk first.
+                AtlasBackgroundProcess.Apply(process.StartInfo);
                 _logger.LogInformation("{File} {Arguments}", process.StartInfo.FileName, process.StartInfo.Arguments);
 
                 try

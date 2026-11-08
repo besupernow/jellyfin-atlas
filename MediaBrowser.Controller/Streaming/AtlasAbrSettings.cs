@@ -16,7 +16,9 @@ namespace MediaBrowser.Controller.Streaming;
 /// <item><c>ATLAS_ABR_ENABLED</c>: <c>false</c> turns the ladder off server-wide (default <c>true</c>).</item>
 /// <item><c>ATLAS_ABR_PREWARM</c>: <c>false</c> stops starting the first segment's transcode at playlist time (default <c>true</c>).</item>
 /// <item><c>ATLAS_ABR_GRID_SECONDS</c>: the keyframe interval the library was conformed to, and the segment length (default 2).</item>
-/// <item><c>ATLAS_ABR_IDLE_LEVEL_SECONDS</c>: how long a quality level may go without segment requests before it is stopped (default 20).</item>
+/// <item><c>ATLAS_ABR_IDLE_LEVEL_SECONDS</c>: how long a quality level may go without segment requests before it is stopped (default 10).</item>
+/// <item><c>ATLAS_ABR_WARM_READY_SEGMENTS</c>: segments past the player's next one that must exist before a warm-up is ready (default 2).</item>
+/// <item><c>ATLAS_BACKGROUND_READS</c>: <c>false</c> stops running subtitle extraction and keyframe analysis in macOS's background (disk-throttled) band (default <c>true</c>).</item>
 /// <item><c>ATLAS_ABR_PEAK_FACTOR</c>: peak/average bitrate ratio assumed for the original file until it has been analyzed (default 1.8).</item>
 /// <item><c>ATLAS_ABR_LADDER</c>: transcoded levels as <c>height:kbps</c> pairs (default <c>480:1500,720:2000,720:4000,1080:8000,1080:12000,1080:20000</c>, the app's quality presets).</item>
 /// </list>
@@ -98,6 +100,13 @@ public static class AtlasAbrSettings
     /// the master playlist is handed out (<c>ATLAS_ABR_PREWARM</c>, default <c>true</c>).
     /// </summary>
     public static bool Prewarm { get; } = ReadBool("ATLAS_ABR_PREWARM", true);
+
+    /// <summary>
+    /// Gets a value indicating whether whole-file reads (subtitle extraction, keyframe analysis) run in
+    /// macOS's background band, so they yield the disk to transcodes (<c>ATLAS_BACKGROUND_READS</c>,
+    /// default <c>true</c>). See <see cref="AtlasBackgroundProcess"/>.
+    /// </summary>
+    public static bool BackgroundReads { get; } = ReadBool("ATLAS_BACKGROUND_READS", true);
 
     /// <summary>
     /// Gets the keyframe grid of the conformed library, in seconds. This is also the segment length.
