@@ -54,8 +54,11 @@ namespace Emby.Server.Implementations.Library
 
             if (mode == SubtitlePlaybackMode.Default)
             {
-                // Load subtitles according to external, default and forced flags.
-                stream = sortedStreams.FirstOrDefault(x => x.IsExternal || x.IsDefault || x.IsForced);
+                // Load subtitles according to default and forced flags.
+                // Atlas: not merely for being external. Every text subtitle in the Atlas library is a
+                // sidecar file (Tdarr extracts them), so "external" no longer means someone added it on
+                // purpose, and stock Jellyfin would turn on whichever sidecar sorts first.
+                stream = sortedStreams.FirstOrDefault(x => x.IsDefault || x.IsForced);
             }
             else if (mode == SubtitlePlaybackMode.Smart)
             {
@@ -112,8 +115,8 @@ namespace Emby.Server.Implementations.Library
             if (mode == SubtitlePlaybackMode.Default)
             {
                 // Prefer embedded metadata over smart logic
-                // Load subtitles according to external, default, and forced flags.
-                filteredStreams = sortedStreams.Where(s => s.IsExternal || s.IsDefault || s.IsForced)
+                // Load subtitles according to default and forced flags (Atlas: not external alone, see above).
+                filteredStreams = sortedStreams.Where(s => s.IsDefault || s.IsForced)
                     .ToList();
             }
             else if (mode == SubtitlePlaybackMode.Smart)

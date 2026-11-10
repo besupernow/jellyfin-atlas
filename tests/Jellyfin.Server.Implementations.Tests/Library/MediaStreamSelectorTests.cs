@@ -1,5 +1,6 @@
 using System;
 using Emby.Server.Implementations.Library;
+using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Model.Entities;
 using Xunit;
 
@@ -50,6 +51,30 @@ public class MediaStreamSelectorTests
         };
 
         Assert.Equal(expectedIndex, MediaStreamSelector.GetDefaultAudioStreamIndex(streams, preferredLanguages, preferDefaultTrack));
+    }
+
+    [Fact]
+    public void GetDefaultSubtitleStreamIndex_DefaultMode_PlainSidecarsStayOff()
+    {
+        var streams = new MediaStream[]
+        {
+            new() { Index = 2, Type = MediaStreamType.Subtitle, Language = "baq", IsExternal = true },
+            new() { Index = 3, Type = MediaStreamType.Subtitle, Language = "eng", IsExternal = true },
+        };
+
+        Assert.Null(MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng"));
+    }
+
+    [Fact]
+    public void GetDefaultSubtitleStreamIndex_DefaultMode_ForcedSidecarStillLoads()
+    {
+        var streams = new MediaStream[]
+        {
+            new() { Index = 2, Type = MediaStreamType.Subtitle, Language = "baq", IsExternal = true },
+            new() { Index = 3, Type = MediaStreamType.Subtitle, Language = "eng", IsExternal = true, IsForced = true },
+        };
+
+        Assert.Equal(3, MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, new[] { "eng" }, SubtitlePlaybackMode.Default, "eng"));
     }
 
     public static TheoryData<MediaStream, int> GetStreamScore_MediaStream_TestData()
