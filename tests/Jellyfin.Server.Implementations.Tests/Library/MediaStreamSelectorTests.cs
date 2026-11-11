@@ -77,6 +77,32 @@ public class MediaStreamSelectorTests
         Assert.Equal(3, MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, new[] { "eng" }, SubtitlePlaybackMode.Default, "eng"));
     }
 
+    [Fact]
+    public void GetDefaultSubtitleStreamIndex_DefaultEmbedded_UsesItsSidecarCopy()
+    {
+        var streams = new MediaStream[]
+        {
+            new() { Index = 2, Type = MediaStreamType.Subtitle, Language = "eng", IsExternal = true, IsHearingImpaired = true },
+            new() { Index = 3, Type = MediaStreamType.Subtitle, Language = "en", IsExternal = true },
+            new() { Index = 9, Type = MediaStreamType.Subtitle, Language = "eng", IsDefault = true },
+        };
+
+        Assert.Equal(3, MediaStreamSelector.GetDefaultSubtitleStreamIndex(streams, Array.Empty<string>(), SubtitlePlaybackMode.Default, "eng"));
+    }
+
+    [Fact]
+    public void PreferSidecar_KeepsEmbeddedWithoutACopy()
+    {
+        var streams = new MediaStream[]
+        {
+            new() { Index = 2, Type = MediaStreamType.Subtitle, Language = "fre", IsExternal = true },
+            new() { Index = 9, Type = MediaStreamType.Subtitle, Language = "eng", IsDefault = true },
+        };
+
+        Assert.Equal(9, MediaStreamSelector.PreferSidecar(streams, 9));
+        Assert.Equal(-1, MediaStreamSelector.PreferSidecar(streams, -1));
+    }
+
     public static TheoryData<MediaStream, int> GetStreamScore_MediaStream_TestData()
     {
         var data = new TheoryData<MediaStream, int>();

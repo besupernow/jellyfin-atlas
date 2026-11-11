@@ -86,7 +86,78 @@ namespace Emby.Server.Implementations.Library
                 stream = BehaviorOnlyForced(sortedStreams, preferredLanguages).FirstOrDefault();
             }
 
-            return stream?.Index;
+            return PreferSidecar(streams, stream?.Index);
+        }
+
+        /// <summary>
+        /// Atlas: swaps an embedded subtitle for its sidecar copy (same language, same forced flag,
+        /// not SDH) when the file has one. Reading an embedded subtitle means extracting it from
+        /// the whole video, which competes with the transcode for the disk and stalls the start;
+        /// the sidecar is a small file read.
+        /// </summary>
+        /// <param name="streams">The item's streams.</param>
+        /// <param name="index">The chosen subtitle index, or null/-1 for none.</param>
+        /// <returns>The index to use.</returns>
+        public static int? PreferSidecar(IEnumerable<MediaStream> streams, int? index)
+        {
+            if (index is null or < 0)
+            {
+                return index;
+            }
+
+            var subtitles = streams.Where(i => i.Type == MediaStreamType.Subtitle).ToList();
+            var chosen = subtitles.FirstOrDefault(i => i.Index == index);
+            if (chosen is null || chosen.IsExternal || string.IsNullOrEmpty(chosen.Language))
+            {
+                return index;
+            }
+
+            var sidecar = subtitles
+                .Where(i => i.IsExternal
+                    && i.IsForced == chosen.IsForced
+                    && SameLanguage(i.Language, chosen.Language))
+                .OrderBy(i => i.IsHearingImpaired == chosen.IsHearingImpaired ? 0 : 1)
+                .ThenBy(i => i.Index)
+                .FirstOrDefault();
+            return sidecar?.Index ?? index;
+        }
+
+        private static bool SameLanguage(string? a, string? b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b))
+            {
+                return false;
+            }
+
+            if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // eng/en, fre/fra/fr, ger/deu/de: the same language under its two- and three-letter codes.
+            static string Key(string code)
+            {
+                var lower = code.Split('-')[0].ToLowerInvariant();
+                return lower switch
+                {
+                    "eng" => "en",
+                    "spa" => "es",
+                    "fre" or "fra" => "fr",
+                    "ger" or "deu" => "de",
+                    "kor" => "ko",
+                    "jpn" => "ja",
+                    "ita" => "it",
+                    "por" => "pt",
+                    "chi" or "zho" => "zh",
+                    "dut" or "nld" => "nl",
+                    "rus" => "ru",
+                    "ara" => "ar",
+                    "baq" or "eus" => "eu",
+                    _ => lower,
+                };
+            }
+
+            return string.Equals(Key(a), Key(b), StringComparison.OrdinalIgnoreCase);
         }
 
         private static IEnumerable<MediaStream> GetSortedStreams(IEnumerable<MediaStream> streams, MediaStreamType type, IReadOnlyList<string> languagePreferences)

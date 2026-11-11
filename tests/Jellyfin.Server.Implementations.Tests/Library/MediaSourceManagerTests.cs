@@ -1,329 +1,1070 @@
+#nullable disable
+
+#pragma warning disable CS1591
+
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Globalization;
+using System.IO;
 using System.Linq;
-using AutoFixture;
-using AutoFixture.AutoMoq;
-using Castle.Components.DictionaryAdapter;
-using Emby.Server.Implementations.IO;
-using Emby.Server.Implementations.Library;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using AsyncKeyedLock;
+using Jellyfin.Data;
+using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
+using Jellyfin.Extensions;
+using Jellyfin.Extensions.Json;
+using MediaBrowser.Common.Configuration;
+using MediaBrowser.Common.Extensions;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Entities;
-using MediaBrowser.Controller.Entities.Audio;
+using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
-using MediaBrowser.Controller.MediaSegments;
+using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Persistence;
+using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
 using MediaBrowser.Model.IO;
 using MediaBrowser.Model.MediaInfo;
-using Moq;
-using Xunit;
+using Microsoft.Extensions.Logging;
 
-namespace Jellyfin.Server.Implementations.Tests.Library
+namespace Emby.Server.Implementations.Library
 {
-    public class MediaSourceManagerTests
+    public class MediaSourceManager : IMediaSourceManager, IDisposable
     {
-        private readonly MediaSourceManager _mediaSourceManager;
-        private readonly Mock<IUserDataManager> _mockUserDataManager;
-        private readonly Mock<ILocalizationManager> _mockLocalizationManager;
-        private Video _item;
-        private User _user;
+        // Do not use a pipe here because Roku http requests to the server will fail, without any explicit error message.
+        private const char LiveStreamIdDelimiter = '_';
 
-        public MediaSourceManagerTests()
+        private readonly IServerApplicationHost _appHost;
+        private readonly IItemRepository _itemRepo;
+        private readonly IUserManager _userManager;
+        private readonly ILibraryManager _libraryManager;
+        private readonly IFileSystem _fileSystem;
+        private readonly ILogger<MediaSourceManager> _logger;
+        private readonly IUserDataManager _userDataManager;
+        private readonly IMediaEncoder _mediaEncoder;
+        private readonly ILocalizationManager _localizationManager;
+        private readonly IApplicationPaths _appPaths;
+        private readonly IDirectoryService _directoryService;
+        private readonly IMediaStreamRepository _mediaStreamRepository;
+        private readonly IMediaAttachmentRepository _mediaAttachmentRepository;
+        private readonly ConcurrentDictionary<string, ILiveStream> _openStreams = new ConcurrentDictionary<string, ILiveStream>(StringComparer.OrdinalIgnoreCase);
+        private readonly AsyncNonKeyedLocker _liveStreamLocker = new(1);
+        private readonly JsonSerializerOptions _jsonOptions = JsonDefaults.Options;
+
+        private IMediaSourceProvider[] _providers;
+
+        public MediaSourceManager(
+            IServerApplicationHost appHost,
+            IItemRepository itemRepo,
+            IApplicationPaths applicationPaths,
+            ILocalizationManager localizationManager,
+            IUserManager userManager,
+            ILibraryManager libraryManager,
+            ILogger<MediaSourceManager> logger,
+            IFileSystem fileSystem,
+            IUserDataManager userDataManager,
+            IMediaEncoder mediaEncoder,
+            IDirectoryService directoryService,
+            IMediaStreamRepository mediaStreamRepository,
+            IMediaAttachmentRepository mediaAttachmentRepository)
         {
-            IFixture fixture = new Fixture().Customize(new AutoMoqCustomization { ConfigureMembers = true });
-            fixture.Inject<IFileSystem>(fixture.Create<ManagedFileSystem>());
-
-            _mockUserDataManager = fixture.Freeze<Mock<IUserDataManager>>();
-            _mockUserDataManager.Setup(m => m.GetUserData(It.IsAny<User>(), It.IsAny<BaseItem>())).Returns(new UserItemData() { Key = "key" });
-
-            _mockLocalizationManager = fixture.Create<Mock<ILocalizationManager>>();
-            _mockLocalizationManager.Setup(m => m.FindLanguageInfo(It.IsAny<string>())).Returns((string s) => string.IsNullOrEmpty(s) ? null : new CultureDto(s, s, s, new EditableList<string> { s }));
-            fixture.Inject(_mockLocalizationManager.Object);
-
-            _mediaSourceManager = fixture.Create<MediaSourceManager>();
-
-            _item = new Video { Id = Guid.NewGuid(), OwnerId = Guid.Empty, ParentId = Guid.Empty };
-
-            _user = fixture.Create<User>();
+            _appHost = appHost;
+            _itemRepo = itemRepo;
+            _userManager = userManager;
+            _libraryManager = libraryManager;
+            _logger = logger;
+            _fileSystem = fileSystem;
+            _userDataManager = userDataManager;
+            _mediaEncoder = mediaEncoder;
+            _localizationManager = localizationManager;
+            _appPaths = applicationPaths;
+            _directoryService = directoryService;
+            _mediaStreamRepository = mediaStreamRepository;
+            _mediaAttachmentRepository = mediaAttachmentRepository;
         }
 
-        [Theory]
-        [InlineData(@"C:\mydir\myfile.ext", MediaProtocol.File)]
-        [InlineData("/mydir/myfile.ext", MediaProtocol.File)]
-        [InlineData("file:///mydir/myfile.ext", MediaProtocol.File)]
-        [InlineData("http://example.com/stream.m3u8", MediaProtocol.Http)]
-        [InlineData("https://example.com/stream.m3u8", MediaProtocol.Http)]
-        [InlineData("rtsp://media.example.com:554/twister/audiotrack", MediaProtocol.Rtsp)]
-        public void GetPathProtocol_ValidArg_Correct(string path, MediaProtocol expected)
-            => Assert.Equal(expected, _mediaSourceManager.GetPathProtocol(path));
-
-        [Theory]
-        [InlineData(5, "eng", "eng", false, true)]
-        [InlineData(5, "eng", "eng", true, true)]
-        [InlineData(2, "ger", "eng", false, true)]
-        [InlineData(2, "ger", "eng", true, true)]
-        [InlineData(1, "fre", "eng", false, true)]
-        [InlineData(2, "fre", "eng", true, true)]
-        [InlineData(5, "OriginalLanguage", "eng", false, false)]
-        [InlineData(4, "OriginalLanguage", "eng", false, true)]
-        [InlineData(5, "OriginalLanguage", "eng", true, false)]
-        [InlineData(5, "OriginalLanguage", "eng", true, true)]
-        [InlineData(2, "OriginalLanguage", "jpn", true, true)]
-        [InlineData(2, "OriginalLanguage", "jpn", false, true)]
-        [InlineData(2, "OriginalLanguage", "jpn,eng", false, true)]
-        [InlineData(4, "OriginalLanguage", null, false, true)]
-        [InlineData(2, "OriginalLanguage", null, true, true)]
-        [InlineData(4, "OriginalLanguage", "", false, true)]
-        [InlineData(2, "OriginalLanguage", "", false, false)]
-        [InlineData(2, "OriginalLanguage", "ger", false, true)]
-        [InlineData(2, "OriginalLanguage", "ger", false, false)]
-        [InlineData(1, "OriginalLanguage", "fre", false, false)]
-        [InlineData(2, "OriginalLanguage", "fre", true, true)]
-        [InlineData(2, "OriginalLanguage", "fre", true, false)]
-        public void SetDefaultAudioStreamIndex_Index_Correct(
-            int expectedIndex,
-            string prefferedLanguage,
-            string? originalLanguage,
-            bool playDefault,
-            bool originalExist)
+        public void AddParts(IEnumerable<IMediaSourceProvider> providers)
         {
-            var streams = new MediaStream[]
-            {
-                new()
-                {
-                    Index = 0,
-                    Type = MediaStreamType.Video,
-                    IsDefault = true
-                },
-                new()
-                {
-                    Index = 1,
-                    Type = MediaStreamType.Audio,
-                    Language = "fre",
-                    IsDefault = false,
-                    IsOriginal = false
-                },
-                new()
-                {
-                    Index = 2,
-                    Type = MediaStreamType.Audio,
-                    Language = "jpn",
-                    IsDefault = true,
-                    IsOriginal = false
-                },
-                new()
-                {
-                    Index = 3,
-                    Type = MediaStreamType.Audio,
-                    Language = "eng",
-                    IsDefault = false,
-                    IsOriginal = false
-                },
-                new()
-                {
-                    Index = 4,
-                    Type = MediaStreamType.Audio,
-                    Language = "eng",
-                    IsDefault = false,
-                    IsOriginal = originalExist,
-                },
-                new()
-                {
-                    Index = 5,
-                    Type = MediaStreamType.Audio,
-                    Language = "eng",
-                    IsDefault = true,
-                    IsOriginal = false,
-                }
-            };
-            var mediaInfo = new MediaSourceInfo
-            {
-                MediaStreams = streams
-            };
-            _user.AudioLanguagePreference = prefferedLanguage;
-            _user.PlayDefaultAudioTrack = playDefault;
-            _item.OriginalLanguage = originalLanguage;
-
-            _mediaSourceManager.SetDefaultAudioAndSubtitleStreamIndices(_item, mediaInfo, _user);
-            Assert.Equal(expectedIndex, mediaInfo.DefaultAudioStreamIndex);
+            _providers = providers.ToArray();
         }
 
-        [Theory]
-        // A remembered full track must not survive a switch to "only forced" (it falls through to
-        // the forced track here); a remembered forced track and "off" still must.
-        [InlineData(SubtitlePlaybackMode.OnlyForced, 2, 3)]
-        [InlineData(SubtitlePlaybackMode.OnlyForced, 3, 3)]
-        [InlineData(SubtitlePlaybackMode.OnlyForced, -1, -1)]
-        [InlineData(SubtitlePlaybackMode.Default, 2, 2)]
-        [InlineData(SubtitlePlaybackMode.Always, 2, 2)]
-        [InlineData(SubtitlePlaybackMode.Smart, 2, 2)]
-        [InlineData(SubtitlePlaybackMode.None, 2, null)]
-        public void SetDefaultSubtitleStreamIndex_RememberedSelection_RespectsSubtitleMode(
-            SubtitlePlaybackMode mode,
-            int rememberedIndex,
-            int? expectedIndex)
+        public IReadOnlyList<MediaStream> GetMediaStreams(MediaStreamQuery query)
         {
-            _mockUserDataManager
-                .Setup(m => m.GetUserData(It.IsAny<User>(), It.IsAny<BaseItem>()))
-                .Returns(new UserItemData { Key = "key", SubtitleStreamIndex = rememberedIndex });
+            var list = _mediaStreamRepository.GetMediaStreams(query);
 
-            var mediaInfo = new MediaSourceInfo
+            foreach (var stream in list)
             {
-                MediaStreams = new MediaStream[]
-                {
-                    new() { Index = 0, Type = MediaStreamType.Video, IsDefault = true },
-                    new() { Index = 1, Type = MediaStreamType.Audio, Language = "eng", IsDefault = true },
-                    new() { Index = 2, Type = MediaStreamType.Subtitle, Language = "eng", IsDefault = true, IsForced = false },
-                    new() { Index = 3, Type = MediaStreamType.Subtitle, Language = "eng", IsDefault = false, IsForced = true }
-                }
-            };
+                stream.SupportsExternalStream = StreamSupportsExternalStream(stream);
+            }
 
-            _user.SubtitleMode = mode;
-            _user.SubtitleLanguagePreference = string.Empty;
-            _user.RememberSubtitleSelections = true;
-            _user.AudioLanguagePreference = string.Empty;
-
-            _mediaSourceManager.SetDefaultAudioAndSubtitleStreamIndices(_item, mediaInfo, _user);
-
-            Assert.Equal(expectedIndex, mediaInfo.DefaultSubtitleStreamIndex);
+            return list;
         }
 
-        [Fact]
-        public void SetDefaultSubtitleStreamIndex_OnlyForcedRemembersFullTrackWithNoForcedStream_SelectsNothing()
+        private static bool StreamSupportsExternalStream(MediaStream stream)
         {
-            _mockUserDataManager
-                .Setup(m => m.GetUserData(It.IsAny<User>(), It.IsAny<BaseItem>()))
-                .Returns(new UserItemData { Key = "key", SubtitleStreamIndex = 2 });
-
-            var mediaInfo = new MediaSourceInfo
+            if (stream.IsExternal)
             {
-                MediaStreams = new MediaStream[]
-                {
-                    new() { Index = 0, Type = MediaStreamType.Video, IsDefault = true },
-                    new() { Index = 1, Type = MediaStreamType.Audio, Language = "eng", IsDefault = true },
-                    new() { Index = 2, Type = MediaStreamType.Subtitle, Language = "eng", IsDefault = true, IsForced = false }
-                }
-            };
+                return true;
+            }
 
-            _user.SubtitleMode = SubtitlePlaybackMode.OnlyForced;
-            _user.SubtitleLanguagePreference = string.Empty;
-            _user.RememberSubtitleSelections = true;
-            _user.AudioLanguagePreference = string.Empty;
+            if (stream.IsTextSubtitleStream)
+            {
+                return true;
+            }
 
-            _mediaSourceManager.SetDefaultAudioAndSubtitleStreamIndices(_item, mediaInfo, _user);
+            if (stream.IsPgsSubtitleStream)
+            {
+                return true;
+            }
 
-            Assert.Null(mediaInfo.DefaultSubtitleStreamIndex);
+            if (stream.IsVobSubSubtitleStream)
+            {
+                return true;
+            }
+
+            return false;
         }
 
-        [Fact]
-        public void GetStaticMediaSources_PrimaryQueried_DefaultsToMostRecentlyPlayedVersion()
+        public IReadOnlyList<MediaStream> GetMediaStreams(Guid itemId)
         {
-            var (primary, alt1, alt2) = SetupVersionGroup();
-            SetupUserDataBatch(new Dictionary<Guid, UserItemData>
+            var list = GetMediaStreams(new MediaStreamQuery
             {
-                [alt1.Id] = new UserItemData { Key = "alt1", PlaybackPositionTicks = 10, LastPlayedDate = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc) },
-                [alt2.Id] = new UserItemData { Key = "alt2", PlaybackPositionTicks = 20, LastPlayedDate = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc) }
+                ItemId = itemId
             });
 
-            var sources = _mediaSourceManager.GetStaticMediaSources(primary, false, _user);
-
-            // The most recently played version is the default source, so resuming plays the right file.
-            // Per-user positions live in each version's UserData, not on the source.
-            Assert.Equal(alt2.Id.ToString("N"), sources[0].Id);
+            return GetMediaStreamsForItem(list);
         }
 
-        [Fact]
-        public void GetStaticMediaSources_AlternateQueried_KeepsOwnSourceFirst()
+        private IReadOnlyList<MediaStream> GetMediaStreamsForItem(IReadOnlyList<MediaStream> streams)
         {
-            var (primary, alt1, alt2) = SetupVersionGroup();
-            SetupUserDataBatch(new Dictionary<Guid, UserItemData>
+            foreach (var stream in streams)
             {
-                [alt2.Id] = new UserItemData { Key = "alt2", PlaybackPositionTicks = 20, LastPlayedDate = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc) }
+                if (stream.Type == MediaStreamType.Subtitle)
+                {
+                    stream.SupportsExternalStream = StreamSupportsExternalStream(stream);
+                }
+            }
+
+            return streams;
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyList<MediaAttachment> GetMediaAttachments(MediaAttachmentQuery query)
+        {
+            return _mediaAttachmentRepository.GetMediaAttachments(query);
+        }
+
+        /// <inheritdoc />
+        public IReadOnlyList<MediaAttachment> GetMediaAttachments(Guid itemId)
+        {
+            return GetMediaAttachments(new MediaAttachmentQuery
+            {
+                ItemId = itemId
             });
-
-            var sources = _mediaSourceManager.GetStaticMediaSources(alt1, false, _user);
-
-            // An explicitly opened version keeps its own source first, even when a sibling was
-            // played more recently.
-            Assert.Equal(alt1.Id.ToString("N"), sources[0].Id);
-            Assert.Equal(3, sources.Count);
         }
 
-        [Fact]
-        public void GetStaticMediaSources_NoProgress_KeepsQueriedItemFirst()
+        public async Task<IReadOnlyList<MediaSourceInfo>> GetPlaybackMediaSources(BaseItem item, User user, bool allowMediaProbe, bool enablePathSubstitution, CancellationToken cancellationToken)
         {
-            var (primary, _, _) = SetupVersionGroup();
-            SetupUserDataBatch([]);
+            var mediaSources = GetStaticMediaSources(item, enablePathSubstitution, user);
+            ResolveSymlinkPaths(mediaSources, enablePathSubstitution);
 
-            var sources = _mediaSourceManager.GetStaticMediaSources(primary, false, _user);
+            // If file is strm or main media stream is missing, force a metadata refresh with remote probing
+            if (allowMediaProbe && mediaSources[0].Type != MediaSourceType.Placeholder
+                && (item.Path.EndsWith(".strm", StringComparison.OrdinalIgnoreCase)
+                    || (item.MediaType == MediaType.Video && mediaSources[0].MediaStreams.All(i => i.Type != MediaStreamType.Video))
+                    || (item.MediaType == MediaType.Audio && mediaSources[0].MediaStreams.All(i => i.Type != MediaStreamType.Audio))))
+            {
+                await item.RefreshMetadata(
+                    new MetadataRefreshOptions(_directoryService)
+                    {
+                        EnableRemoteContentProbe = true,
+                        MetadataRefreshMode = MetadataRefreshMode.FullRefresh
+                    },
+                    cancellationToken).ConfigureAwait(false);
 
-            Assert.Equal(primary.Id.ToString("N"), sources[0].Id);
+                mediaSources = GetStaticMediaSources(item, enablePathSubstitution, user);
+                ResolveSymlinkPaths(mediaSources, enablePathSubstitution);
+            }
+
+            var dynamicMediaSources = await GetDynamicMediaSources(item, cancellationToken).ConfigureAwait(false);
+
+            var list = new List<MediaSourceInfo>();
+
+            list.AddRange(mediaSources);
+
+            foreach (var source in dynamicMediaSources)
+            {
+                // Validate that this is actually possible
+                if (source.SupportsDirectStream)
+                {
+                    source.SupportsDirectStream = SupportsDirectStream(source.Path, source.Protocol);
+                }
+
+                if (user is not null)
+                {
+                    SetDefaultAudioAndSubtitleStreamIndices(item, source, user);
+
+                    if (item.MediaType == MediaType.Audio)
+                    {
+                        source.SupportsTranscoding = user.HasPermission(PermissionKind.EnableAudioPlaybackTranscoding);
+                    }
+                    else if (item.MediaType == MediaType.Video)
+                    {
+                        source.SupportsTranscoding = user.HasPermission(PermissionKind.EnableVideoPlaybackTranscoding);
+                        source.SupportsDirectStream = user.HasPermission(PermissionKind.EnablePlaybackRemuxing);
+                    }
+                }
+
+                list.Add(source);
+            }
+
+            var preferredId = mediaSources.Count > 0 && Guid.TryParse(mediaSources[0].Id, out var topSourceId)
+                ? topSourceId
+                : item.Id;
+
+            return SortMediaSources(list, preferredId).ToArray();
         }
 
-        [Fact]
-        public void GetStaticMediaSources_ItemWithoutMediaSources_ThrowsArgumentException()
+        /// <inheritdoc />>
+        public MediaProtocol GetPathProtocol(string path)
         {
-            // A container queued by mistake is a bad request, not a server fault.
-            Assert.Throws<ArgumentException>(
-                () => _mediaSourceManager.GetStaticMediaSources(new MusicArtist { Id = Guid.NewGuid() }, false, _user));
+            if (string.IsNullOrEmpty(path))
+            {
+                return MediaProtocol.File;
+            }
+
+            if (path.StartsWith("Rtsp", StringComparison.OrdinalIgnoreCase))
+            {
+                return MediaProtocol.Rtsp;
+            }
+
+            if (path.StartsWith("Rtmp", StringComparison.OrdinalIgnoreCase))
+            {
+                return MediaProtocol.Rtmp;
+            }
+
+            if (path.StartsWith("Http", StringComparison.OrdinalIgnoreCase))
+            {
+                return MediaProtocol.Http;
+            }
+
+            if (path.StartsWith("rtp", StringComparison.OrdinalIgnoreCase))
+            {
+                return MediaProtocol.Rtp;
+            }
+
+            if (path.StartsWith("ftp", StringComparison.OrdinalIgnoreCase))
+            {
+                return MediaProtocol.Ftp;
+            }
+
+            if (path.StartsWith("udp", StringComparison.OrdinalIgnoreCase))
+            {
+                return MediaProtocol.Udp;
+            }
+
+            return _fileSystem.IsPathFile(path) ? MediaProtocol.File : MediaProtocol.Http;
         }
 
-        [Fact]
-        public void GetStaticMediaSources_NoUser_DoesNotTouchUserData()
+        public bool SupportsDirectStream(string path, MediaProtocol protocol)
         {
-            var (primary, _, _) = SetupVersionGroup();
+            if (protocol == MediaProtocol.File)
+            {
+                return true;
+            }
 
-            var sources = _mediaSourceManager.GetStaticMediaSources(primary, false);
+            if (protocol == MediaProtocol.Http)
+            {
+                if (path is not null)
+                {
+                    if (path.Contains(".m3u", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return false;
+                    }
 
-            Assert.Equal(primary.Id.ToString("N"), sources[0].Id);
-            _mockUserDataManager.Verify(x => x.GetUserDataBatch(It.IsAny<IReadOnlyList<BaseItem>>(), It.IsAny<User>()), Times.Never);
+                    return true;
+                }
+            }
+
+            return false;
         }
 
-        private void SetupUserDataBatch(Dictionary<Guid, UserItemData> userData)
+        private async Task<IEnumerable<MediaSourceInfo>> GetDynamicMediaSources(BaseItem item, CancellationToken cancellationToken)
         {
-            _mockUserDataManager
-                .Setup(x => x.GetUserDataBatch(It.IsAny<IReadOnlyList<BaseItem>>(), It.IsAny<User>()))
-                .Returns((IReadOnlyList<BaseItem> items, User _) => items
-                    .Where(i => userData.ContainsKey(i.Id))
-                    .ToDictionary(i => i.Id, i => userData[i.Id]));
+            var tasks = _providers.Select(i => GetDynamicMediaSources(item, i, cancellationToken));
+            var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            return results.SelectMany(i => i);
         }
 
-        private static (Video Primary, Video Alt1, Video Alt2) SetupVersionGroup()
+        private async Task<IEnumerable<MediaSourceInfo>> GetDynamicMediaSources(BaseItem item, IMediaSourceProvider provider, CancellationToken cancellationToken)
         {
-            var primary = new Video { Id = Guid.NewGuid(), Path = "/Movies/Movie/Movie.mkv" };
-            var alt1 = new Video { Id = Guid.NewGuid(), Path = "/Movies/Movie/Movie - 1080p.mkv", PrimaryVersionId = primary.Id };
-            var alt2 = new Video { Id = Guid.NewGuid(), Path = "/Movies/Movie/Movie - 4K.mkv", PrimaryVersionId = primary.Id };
+            try
+            {
+                var sources = await provider.GetMediaSources(item, cancellationToken).ConfigureAwait(false);
+                var list = sources.ToList();
 
-            // BaseItem.GetMediaSources runs against the static service locators.
-            var mediaSourceManager = new Mock<IMediaSourceManager>();
-            mediaSourceManager.Setup(x => x.GetPathProtocol(It.IsAny<string>())).Returns(MediaProtocol.File);
-            mediaSourceManager.Setup(x => x.GetMediaStreams(It.IsAny<Guid>())).Returns(new List<MediaStream>());
-            mediaSourceManager.Setup(x => x.GetMediaAttachments(It.IsAny<Guid>())).Returns(new List<MediaAttachment>());
+                foreach (var mediaSource in list)
+                {
+                    mediaSource.InferTotalBitrate();
 
-            var segmentManager = new Mock<IMediaSegmentManager>();
-            segmentManager.Setup(x => x.IsTypeSupported(It.IsAny<BaseItem>())).Returns(false);
+                    SetKeyProperties(provider, mediaSource);
+                }
 
-            var libraryManager = new Mock<ILibraryManager>();
-            libraryManager.Setup(x => x.GetLinkedAlternateVersions(It.IsAny<Video>())).Returns(Array.Empty<Video>());
-            libraryManager.Setup(x => x.GetLocalAlternateVersionIds(primary)).Returns(new[] { alt1.Id, alt2.Id });
-            libraryManager.Setup(x => x.GetLocalAlternateVersionIds(alt1)).Returns(Array.Empty<Guid>());
-            libraryManager.Setup(x => x.GetLocalAlternateVersionIds(alt2)).Returns(Array.Empty<Guid>());
-            libraryManager.Setup(x => x.GetItemById(primary.Id)).Returns(primary);
-            libraryManager.Setup(x => x.GetItemById(alt1.Id)).Returns(alt1);
-            libraryManager.Setup(x => x.GetItemById(alt2.Id)).Returns(alt2);
+                return list;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error getting media sources");
+                return [];
+            }
+        }
 
-            var recordingsManager = new Mock<IRecordingsManager>();
-            recordingsManager.Setup(x => x.GetActiveRecordingInfo(It.IsAny<string>())).Returns((ActiveRecordingInfo?)null);
+        /// <summary>
+        /// Resolves symlinked file paths on the supplied sources to the real on-disk target.
+        /// Skipped when <paramref name="enablePathSubstitution"/> is set because the path may
+        /// already have been rewritten to a UNC/URL meant for the client to consume directly.
+        /// </summary>
+        private static void ResolveSymlinkPaths(IReadOnlyList<MediaSourceInfo> sources, bool enablePathSubstitution)
+        {
+            if (enablePathSubstitution)
+            {
+                return;
+            }
 
-            BaseItem.MediaSegmentManager = segmentManager.Object;
-            BaseItem.MediaSourceManager = mediaSourceManager.Object;
-            BaseItem.LibraryManager = libraryManager.Object;
-            Video.RecordingsManager = recordingsManager.Object;
+            foreach (var source in sources)
+            {
+                if (source.Protocol == MediaProtocol.File
+                    && FileSystemHelper.ResolveLinkTarget(source.Path, returnFinalTarget: true) is { Exists: true } target)
+                {
+                    source.Path = target.FullName;
+                }
+            }
+        }
 
-            return (primary, alt1, alt2);
+        private static void SetKeyProperties(IMediaSourceProvider provider, MediaSourceInfo mediaSource)
+        {
+            var prefix = provider.GetType().FullName.GetMD5().ToString("N", CultureInfo.InvariantCulture) + LiveStreamIdDelimiter;
+
+            if (!string.IsNullOrEmpty(mediaSource.OpenToken) && !mediaSource.OpenToken.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                mediaSource.OpenToken = prefix + mediaSource.OpenToken;
+            }
+
+            if (!string.IsNullOrEmpty(mediaSource.LiveStreamId) && !mediaSource.LiveStreamId.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                mediaSource.LiveStreamId = prefix + mediaSource.LiveStreamId;
+            }
+        }
+
+        public async Task<MediaSourceInfo> GetMediaSource(BaseItem item, string mediaSourceId, string liveStreamId, bool enablePathSubstitution, CancellationToken cancellationToken)
+        {
+            if (!string.IsNullOrEmpty(liveStreamId))
+            {
+                return await GetLiveStream(liveStreamId, cancellationToken).ConfigureAwait(false);
+            }
+
+            var sources = await GetPlaybackMediaSources(item, null, false, enablePathSubstitution, cancellationToken).ConfigureAwait(false);
+
+            return sources.FirstOrDefault(i => string.Equals(i.Id, mediaSourceId, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public IReadOnlyList<MediaSourceInfo> GetStaticMediaSources(BaseItem item, bool enablePathSubstitution, User user = null)
+        {
+            ArgumentNullException.ThrowIfNull(item);
+
+            // Clients can ask for the sources of an item that has none (a container queued by mistake).
+            if (item is not IHasMediaSources hasMediaSources)
+            {
+                throw new ArgumentException(
+                    string.Format(CultureInfo.InvariantCulture, "{0} {1} has no media sources and cannot be played.", item.GetType().Name, item.Id),
+                    nameof(item));
+            }
+
+            var sources = hasMediaSources.GetMediaSources(enablePathSubstitution);
+
+            if (user is not null)
+            {
+                sources = sources
+                    .Where(source => !Guid.TryParse(source.Id, out var sourceId)
+                        || sourceId.Equals(item.Id)
+                        || _libraryManager.GetItemById<BaseItem>(sourceId, user) is not null)
+                    .ToArray();
+
+                foreach (var source in sources)
+                {
+                    SetDefaultAudioAndSubtitleStreamIndices(item, source, user);
+
+                    if (item.MediaType == MediaType.Audio)
+                    {
+                        source.SupportsTranscoding = user.HasPermission(PermissionKind.EnableAudioPlaybackTranscoding);
+                    }
+                    else if (item.MediaType == MediaType.Video)
+                    {
+                        source.SupportsTranscoding = user.HasPermission(PermissionKind.EnableVideoPlaybackTranscoding);
+                        source.SupportsDirectStream = user.HasPermission(PermissionKind.EnablePlaybackRemuxing);
+                    }
+                }
+
+                sources = SetAlternateVersionResumeStates(item, sources, user);
+            }
+
+            return sources;
+        }
+
+        /// <summary>
+        /// When the queried item is a primary, moves the most recently played version to the front so
+        /// that resuming without an explicit source selection plays the version that was last watched.
+        /// A directly queried alternate version keeps its own source first. Per-user playback position
+        /// is not surfaced on the source itself; it is carried by each version's own UserData.
+        /// </summary>
+        /// <param name="item">The queried item.</param>
+        /// <param name="sources">The item's media sources.</param>
+        /// <param name="user">The user.</param>
+        /// <returns>The media sources, reordered when a version drives resume.</returns>
+        private IReadOnlyList<MediaSourceInfo> SetAlternateVersionResumeStates(BaseItem item, IReadOnlyList<MediaSourceInfo> sources, User user)
+        {
+            // For a video, multiple sources means alternate versions.
+            if (item is not Video video || sources.Count < 2)
+            {
+                return sources;
+            }
+
+            var versions = video.GetAllVersions();
+            if (versions.Count < 2)
+            {
+                return sources;
+            }
+
+            var userDataByVersion = _userDataManager.GetUserDataBatch(versions, user);
+            var dataBySourceId = new Dictionary<string, UserItemData>(versions.Count, StringComparer.OrdinalIgnoreCase);
+            foreach (var version in versions)
+            {
+                if (userDataByVersion.TryGetValue(version.Id, out var data))
+                {
+                    dataBySourceId[version.Id.ToString("N", CultureInfo.InvariantCulture)] = data;
+                }
+            }
+
+            // Reorder only for a resumable (in-progress) version;
+            // a completed version has no position to resume, so it must not be pulled to the front here.
+            var resumeSource = VersionPlaybackSelector.SelectMostRecentlyPlayed(
+                sources,
+                source => source.Id is not null ? dataBySourceId.GetValueOrDefault(source.Id) : null,
+                data => data.PlaybackPositionTicks > 0);
+
+            if (resumeSource is not null && !video.PrimaryVersionId.HasValue && !ReferenceEquals(sources[0], resumeSource))
+            {
+                var reordered = new List<MediaSourceInfo>(sources.Count) { resumeSource };
+                reordered.AddRange(sources.Where(s => !ReferenceEquals(s, resumeSource)));
+                return reordered;
+            }
+
+            return sources;
+        }
+
+        private IReadOnlyList<string> NormalizeLanguage(string language)
+        {
+            if (string.IsNullOrEmpty(language))
+            {
+                return [];
+            }
+
+            var culture = _localizationManager.FindLanguageInfo(language);
+            if (culture is not null)
+            {
+                return culture.Name.Contains('-', StringComparison.OrdinalIgnoreCase) ? [culture.Name] : culture.ThreeLetterISOLanguageNames;
+            }
+
+            return [language];
+        }
+
+        private void SetDefaultSubtitleStreamIndex(MediaSourceInfo source, UserItemData userData, User user, bool allowRememberingSelection)
+        {
+            if (userData is not null
+                && userData.SubtitleStreamIndex.HasValue
+                && user.RememberSubtitleSelections
+                && user.SubtitleMode != SubtitlePlaybackMode.None
+                && allowRememberingSelection)
+            {
+                var index = userData.SubtitleStreamIndex.Value;
+                // Make sure the saved index is still valid
+                var savedStream = source.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Subtitle && i.Index == index);
+                // "Only forced" rules out full tracks entirely, so a remembered one must not resurrect them.
+                // The client reports whatever is playing, so an index remembered under another mode sticks forever otherwise.
+                if (index == -1
+                    || (savedStream is not null
+                        && (user.SubtitleMode != SubtitlePlaybackMode.OnlyForced || savedStream.IsForced)))
+                {
+                    source.DefaultSubtitleStreamIndex = MediaStreamSelector.PreferSidecar(source.MediaStreams, index);
+                    return;
+                }
+            }
+
+            var preferredSubs = NormalizeLanguage(user.SubtitleLanguagePreference);
+
+            var defaultAudioIndex = source.DefaultAudioStreamIndex;
+            var audioLanguage = defaultAudioIndex is null
+                ? null
+                : source.MediaStreams.Where(i => i.Type == MediaStreamType.Audio && i.Index == defaultAudioIndex).Select(i => i.Language).FirstOrDefault();
+
+            source.DefaultSubtitleStreamIndex = MediaStreamSelector.GetDefaultSubtitleStreamIndex(
+                source.MediaStreams,
+                preferredSubs,
+                user.SubtitleMode,
+                audioLanguage);
+
+            MediaStreamSelector.SetSubtitleStreamScores(source.MediaStreams, preferredSubs, user.SubtitleMode, audioLanguage);
+        }
+
+        private void SetDefaultAudioStreamIndex(MediaSourceInfo source, UserItemData userData, User user, bool allowRememberingSelection, string originalLanguage)
+        {
+            if (userData is not null && userData.AudioStreamIndex.HasValue && user.RememberAudioSelections && allowRememberingSelection)
+            {
+                var index = userData.AudioStreamIndex.Value;
+                // Make sure the saved index is still valid
+                if (source.MediaStreams.Any(i => i.Type == MediaStreamType.Audio && i.Index == index))
+                {
+                    source.DefaultAudioStreamIndex = index;
+                    source.DefaultAudioIndexSource = AudioIndexSource.User;
+                    return;
+                }
+            }
+
+            if (string.Equals(user.AudioLanguagePreference, "OriginalLanguage", StringComparison.OrdinalIgnoreCase))
+            {
+                if (user.PlayDefaultAudioTrack)
+                {
+                    source.DefaultAudioStreamIndex = MediaStreamSelector.GetDefaultAudioStreamIndex(
+                        source.MediaStreams,
+                        NormalizeLanguage(originalLanguage),
+                        user.PlayDefaultAudioTrack);
+                    return;
+                }
+
+                var originalIndex = source.MediaStreams.FindIndex(i => i.Type == MediaStreamType.Audio && i.IsOriginal);
+
+                if (!string.IsNullOrWhiteSpace(originalLanguage) && originalIndex != -1)
+                {
+                    var mediaLanguageOriginal = source.MediaStreams[originalIndex].Language;
+                    if (NormalizeLanguage(mediaLanguageOriginal).Contains(NormalizeLanguage(originalLanguage).FirstOrDefault()))
+                    {
+                        source.DefaultAudioStreamIndex = originalIndex;
+                        return;
+                    }
+                }
+                else if (originalIndex != -1)
+                {
+                    source.DefaultAudioStreamIndex = originalIndex;
+                    return;
+                }
+            }
+
+            var preferredAudio = string.Equals(user.AudioLanguagePreference, "OriginalLanguage", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(originalLanguage)
+                ? NormalizeLanguage(originalLanguage)
+                : NormalizeLanguage(user.AudioLanguagePreference);
+
+            source.DefaultAudioStreamIndex = MediaStreamSelector.GetDefaultAudioStreamIndex(source.MediaStreams, preferredAudio, user.PlayDefaultAudioTrack);
+            if (user.PlayDefaultAudioTrack)
+            {
+                source.DefaultAudioIndexSource |= AudioIndexSource.Default;
+            }
+
+            if (preferredAudio.Count > 0)
+            {
+                source.DefaultAudioIndexSource |= AudioIndexSource.Language;
+            }
+        }
+
+        public void SetDefaultAudioAndSubtitleStreamIndices(BaseItem item, MediaSourceInfo source, User user)
+        {
+            // Item would only be null if the app didn't supply ItemId as part of the live stream open request
+            var mediaType = item?.MediaType ?? MediaType.Video;
+
+            if (mediaType == MediaType.Video)
+            {
+                var userData = item is null ? null : _userDataManager.GetUserData(user, item);
+
+                var allowRememberingSelection = item is null || item.EnableRememberingTrackSelections;
+
+                var originalLanguage = item?.GetInheritedOriginalLanguage();
+
+                SetDefaultAudioStreamIndex(source, userData, user, allowRememberingSelection, originalLanguage);
+                SetDefaultSubtitleStreamIndex(source, userData, user, allowRememberingSelection);
+            }
+            else if (mediaType == MediaType.Audio)
+            {
+                var audio = source.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Audio);
+
+                if (audio is not null)
+                {
+                    source.DefaultAudioStreamIndex = audio.Index;
+                }
+            }
+        }
+
+        private static IEnumerable<MediaSourceInfo> SortMediaSources(IEnumerable<MediaSourceInfo> sources, Guid preferredItemId = default)
+        {
+            // The source belonging to the queried item sorts first so it stays the default that gets played.
+            var preferredId = preferredItemId.IsEmpty()
+                ? null
+                : preferredItemId.ToString("N", CultureInfo.InvariantCulture);
+
+            return sources
+                .OrderByDescending(i => preferredId is not null && string.Equals(i.Id, preferredId, StringComparison.OrdinalIgnoreCase))
+                .ThenBy(i =>
+                {
+                    if (i.VideoType.HasValue && i.VideoType.Value == VideoType.VideoFile)
+                    {
+                        return 0;
+                    }
+
+                    return 1;
+                })
+                .ThenBy(i => i.Video3DFormat.HasValue ? 1 : 0)
+                .ThenByDescending(i =>
+                {
+                    var stream = i.VideoStream;
+
+                    return stream?.Width ?? 0;
+                })
+                .Where(i => i.Type != MediaSourceType.Placeholder);
+        }
+
+        public async Task<Tuple<LiveStreamResponse, IDirectStreamProvider>> OpenLiveStreamInternal(LiveStreamRequest request, CancellationToken cancellationToken)
+        {
+            MediaSourceInfo mediaSource;
+            ILiveStream liveStream;
+
+            using (await _liveStreamLocker.LockAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var (provider, keyId) = GetProvider(request.OpenToken);
+
+                var currentLiveStreams = _openStreams.Values.ToList();
+
+                liveStream = await provider.OpenMediaSource(keyId, currentLiveStreams, cancellationToken).ConfigureAwait(false);
+
+                mediaSource = liveStream.MediaSource;
+
+                // Validate that this is actually possible
+                if (mediaSource.SupportsDirectStream)
+                {
+                    mediaSource.SupportsDirectStream = SupportsDirectStream(mediaSource.Path, mediaSource.Protocol);
+                }
+
+                SetKeyProperties(provider, mediaSource);
+
+                _openStreams[mediaSource.LiveStreamId] = liveStream;
+            }
+
+            try
+            {
+                if (mediaSource.MediaStreams.Any(i => i.Index != -1) || !mediaSource.SupportsProbing)
+                {
+                    AddMediaInfo(mediaSource);
+                }
+                else
+                {
+                    // hack - these two values were taken from LiveTVMediaSourceProvider
+                    string cacheKey = request.OpenToken;
+
+                    await new LiveStreamHelper(_mediaEncoder, _logger, _appPaths)
+                        .AddMediaInfoWithProbe(mediaSource, false, cacheKey, true, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error probing live tv stream");
+                AddMediaInfo(mediaSource);
+            }
+
+            // TODO: @bond Fix
+            var json = JsonSerializer.SerializeToUtf8Bytes(mediaSource, _jsonOptions);
+            _logger.LogInformation("Live stream opened: {@MediaSource}", mediaSource);
+            var clone = JsonSerializer.Deserialize<MediaSourceInfo>(json, _jsonOptions);
+
+            if (!request.UserId.IsEmpty())
+            {
+                var user = _userManager.GetUserById(request.UserId);
+                var item = request.ItemId.IsEmpty()
+                    ? null
+                    : _libraryManager.GetItemById(request.ItemId);
+                SetDefaultAudioAndSubtitleStreamIndices(item, clone, user);
+            }
+
+            return new Tuple<LiveStreamResponse, IDirectStreamProvider>(new LiveStreamResponse(clone), liveStream as IDirectStreamProvider);
+        }
+
+        private static void AddMediaInfo(MediaSourceInfo mediaSource)
+        {
+            mediaSource.DefaultSubtitleStreamIndex = null;
+
+            // Null this out so that it will be treated like a live stream
+            if (mediaSource.IsInfiniteStream)
+            {
+                mediaSource.RunTimeTicks = null;
+            }
+
+            var audioStream = mediaSource.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Audio);
+
+            if (audioStream is null || audioStream.Index == -1)
+            {
+                mediaSource.DefaultAudioStreamIndex = null;
+            }
+            else
+            {
+                mediaSource.DefaultAudioStreamIndex = audioStream.Index;
+            }
+
+            var videoStream = mediaSource.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Video);
+            if (videoStream is not null)
+            {
+                if (!videoStream.BitRate.HasValue)
+                {
+                    var width = videoStream.Width ?? 1920;
+
+                    if (width >= 3000)
+                    {
+                        videoStream.BitRate = 30000000;
+                    }
+                    else if (width >= 1900)
+                    {
+                        videoStream.BitRate = 20000000;
+                    }
+                    else if (width >= 1200)
+                    {
+                        videoStream.BitRate = 8000000;
+                    }
+                    else if (width >= 700)
+                    {
+                        videoStream.BitRate = 2000000;
+                    }
+                }
+            }
+
+            // Try to estimate this
+            mediaSource.InferTotalBitrate();
+        }
+
+        public async Task<LiveStreamResponse> OpenLiveStream(LiveStreamRequest request, CancellationToken cancellationToken)
+        {
+            var result = await OpenLiveStreamInternal(request, cancellationToken).ConfigureAwait(false);
+            return result.Item1;
+        }
+
+        public async Task<MediaSourceInfo> GetLiveStreamMediaInfo(string id, CancellationToken cancellationToken)
+        {
+            // TODO probably shouldn't throw here but it is kept for "backwards compatibility"
+            var liveStreamInfo = GetLiveStreamInfo(id) ?? throw new ResourceNotFoundException();
+
+            var mediaSource = liveStreamInfo.MediaSource;
+
+            if (liveStreamInfo is IDirectStreamProvider)
+            {
+                var info = await _mediaEncoder.GetMediaInfo(
+                    new MediaInfoRequest
+                    {
+                        MediaSource = mediaSource,
+                        ExtractChapters = false,
+                        MediaType = DlnaProfileType.Video
+                    },
+                    cancellationToken).ConfigureAwait(false);
+
+                mediaSource.MediaStreams = info.MediaStreams;
+                mediaSource.Container = info.Container;
+                mediaSource.Bitrate = info.Bitrate;
+            }
+
+            return mediaSource;
+        }
+
+        public async Task AddMediaInfoWithProbe(MediaSourceInfo mediaSource, bool isAudio, string cacheKey, bool addProbeDelay, bool isLiveStream, CancellationToken cancellationToken)
+        {
+            var originalRuntime = mediaSource.RunTimeTicks;
+
+            var now = DateTime.UtcNow;
+
+            MediaInfo mediaInfo = null;
+            var cacheFilePath = string.IsNullOrEmpty(cacheKey) ? null : Path.Combine(_appPaths.CachePath, "mediainfo", cacheKey.GetMD5().ToString("N", CultureInfo.InvariantCulture) + ".json");
+
+            if (!string.IsNullOrEmpty(cacheKey))
+            {
+                FileStream jsonStream = AsyncFile.OpenRead(cacheFilePath);
+                try
+                {
+                    mediaInfo = await JsonSerializer.DeserializeAsync<MediaInfo>(jsonStream, _jsonOptions, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Error parsing cached media info.");
+                }
+                finally
+                {
+                    await jsonStream.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+
+            if (mediaInfo is null)
+            {
+                if (addProbeDelay)
+                {
+                    var delayMs = mediaSource.AnalyzeDurationMs ?? 0;
+                    delayMs = Math.Max(3000, delayMs);
+                    await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+                }
+
+                if (isLiveStream)
+                {
+                    mediaSource.AnalyzeDurationMs = 3000;
+                }
+
+                mediaInfo = await _mediaEncoder.GetMediaInfo(
+                    new MediaInfoRequest
+                    {
+                        MediaSource = mediaSource,
+                        MediaType = isAudio ? DlnaProfileType.Audio : DlnaProfileType.Video,
+                        ExtractChapters = false
+                    },
+                    cancellationToken).ConfigureAwait(false);
+
+                if (cacheFilePath is not null)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(cacheFilePath));
+                    FileStream createStream = AsyncFile.Create(cacheFilePath);
+                    await using (createStream.ConfigureAwait(false))
+                    {
+                        await JsonSerializer.SerializeAsync(createStream, mediaInfo, _jsonOptions, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    // _logger.LogDebug("Saved media info to {0}", cacheFilePath);
+                }
+            }
+
+            var mediaStreams = mediaInfo.MediaStreams;
+
+            if (isLiveStream && !string.IsNullOrEmpty(cacheKey))
+            {
+                var newList = new List<MediaStream>();
+                newList.AddRange(mediaStreams.Where(i => i.Type == MediaStreamType.Video).Take(1));
+                newList.AddRange(mediaStreams.Where(i => i.Type == MediaStreamType.Audio).Take(1));
+
+                foreach (var stream in newList)
+                {
+                    stream.Index = -1;
+                    stream.Language = null;
+                }
+
+                mediaStreams = newList;
+            }
+
+            _logger.LogInformation("Live tv media info probe took {0} seconds", (DateTime.UtcNow - now).TotalSeconds.ToString(CultureInfo.InvariantCulture));
+
+            mediaSource.Bitrate = mediaInfo.Bitrate;
+            mediaSource.Container = mediaInfo.Container;
+            mediaSource.Formats = mediaInfo.Formats;
+            mediaSource.MediaStreams = mediaStreams;
+            mediaSource.RunTimeTicks = mediaInfo.RunTimeTicks;
+            mediaSource.Size = mediaInfo.Size;
+            mediaSource.Timestamp = mediaInfo.Timestamp;
+            mediaSource.Video3DFormat = mediaInfo.Video3DFormat;
+            mediaSource.VideoType = mediaInfo.VideoType;
+
+            mediaSource.DefaultSubtitleStreamIndex = null;
+
+            if (isLiveStream)
+            {
+                // Null this out so that it will be treated like a live stream
+                if (!originalRuntime.HasValue)
+                {
+                    mediaSource.RunTimeTicks = null;
+                }
+            }
+
+            var audioStream = mediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Audio);
+
+            if (audioStream is null || audioStream.Index == -1)
+            {
+                mediaSource.DefaultAudioStreamIndex = null;
+            }
+            else
+            {
+                mediaSource.DefaultAudioStreamIndex = audioStream.Index;
+            }
+
+            var videoStream = mediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Video);
+            if (videoStream is not null)
+            {
+                if (!videoStream.BitRate.HasValue)
+                {
+                    var width = videoStream.Width ?? 1920;
+
+                    if (width >= 3000)
+                    {
+                        videoStream.BitRate = 30000000;
+                    }
+                    else if (width >= 1900)
+                    {
+                        videoStream.BitRate = 20000000;
+                    }
+                    else if (width >= 1200)
+                    {
+                        videoStream.BitRate = 8000000;
+                    }
+                    else if (width >= 700)
+                    {
+                        videoStream.BitRate = 2000000;
+                    }
+                }
+
+                // This is coming up false and preventing stream copy
+                videoStream.IsAVC = null;
+            }
+
+            if (isLiveStream)
+            {
+                mediaSource.AnalyzeDurationMs = 3000;
+            }
+
+            // Try to estimate this
+            mediaSource.InferTotalBitrate(true);
+        }
+
+        public Task<Tuple<MediaSourceInfo, IDirectStreamProvider>> GetLiveStreamWithDirectStreamProvider(string id, CancellationToken cancellationToken)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(id);
+
+            var info = GetLiveStreamInfo(id);
+            if (info is null)
+            {
+                return Task.FromResult<Tuple<MediaSourceInfo, IDirectStreamProvider>>(new Tuple<MediaSourceInfo, IDirectStreamProvider>(null, null));
+            }
+
+            return Task.FromResult<Tuple<MediaSourceInfo, IDirectStreamProvider>>(new Tuple<MediaSourceInfo, IDirectStreamProvider>(info.MediaSource, info as IDirectStreamProvider));
+        }
+
+        public ILiveStream GetLiveStreamInfo(string id)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(id);
+
+            if (_openStreams.TryGetValue(id, out ILiveStream info))
+            {
+                return info;
+            }
+
+            return null;
+        }
+
+        /// <inheritdoc />
+        public ILiveStream GetLiveStreamInfoByUniqueId(string uniqueId)
+        {
+            return _openStreams.Values.FirstOrDefault(stream => string.Equals(uniqueId, stream?.UniqueId, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public async Task<MediaSourceInfo> GetLiveStream(string id, CancellationToken cancellationToken)
+        {
+            var result = await GetLiveStreamWithDirectStreamProvider(id, cancellationToken).ConfigureAwait(false);
+            return result.Item1;
+        }
+
+        public async Task<IReadOnlyList<MediaSourceInfo>> GetRecordingStreamMediaSources(ActiveRecordingInfo info, CancellationToken cancellationToken)
+        {
+            var stream = new MediaSourceInfo
+            {
+                EncoderPath = _appHost.GetApiUrlForLocalAccess() + "/LiveTv/LiveRecordings/" + info.Id + "/stream",
+                EncoderProtocol = MediaProtocol.Http,
+                Path = info.Path,
+                Protocol = MediaProtocol.File,
+                Id = info.Id,
+                SupportsDirectPlay = false,
+                SupportsDirectStream = true,
+                SupportsTranscoding = true,
+                IsInfiniteStream = true,
+                RequiresOpening = false,
+                RequiresClosing = false,
+                BufferMs = 0,
+                IgnoreDts = true,
+                IgnoreIndex = true
+            };
+
+            await new LiveStreamHelper(_mediaEncoder, _logger, _appPaths)
+                .AddMediaInfoWithProbe(stream, false, false, cancellationToken).ConfigureAwait(false);
+
+            return [stream];
+        }
+
+        public async Task CloseLiveStream(string id)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(id);
+
+            using (await _liveStreamLocker.LockAsync().ConfigureAwait(false))
+            {
+                if (_openStreams.TryGetValue(id, out ILiveStream liveStream))
+                {
+                    liveStream.ConsumerCount--;
+
+                    _logger.LogInformation("Live stream {0} consumer count is now {1}", liveStream.OriginalStreamId, liveStream.ConsumerCount);
+
+                    if (liveStream.ConsumerCount <= 0)
+                    {
+                        _openStreams.TryRemove(id, out _);
+
+                        _logger.LogInformation("Closing live stream {0}", id);
+
+                        await liveStream.Close().ConfigureAwait(false);
+                        _logger.LogInformation("Live stream {0} closed successfully", id);
+                    }
+                }
+            }
+        }
+
+        private (IMediaSourceProvider MediaSourceProvider, string KeyId) GetProvider(string key)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(key);
+
+            var keys = key.Split(LiveStreamIdDelimiter, 2);
+
+            var provider = _providers.FirstOrDefault(i => string.Equals(i.GetType().FullName.GetMD5().ToString("N", CultureInfo.InvariantCulture), keys[0], StringComparison.OrdinalIgnoreCase));
+
+            var splitIndex = key.IndexOf(LiveStreamIdDelimiter, StringComparison.Ordinal);
+            var keyId = key.Substring(splitIndex + 1);
+
+            return (provider, keyId);
+        }
+
+        /// <inheritdoc />
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Releases unmanaged and - optionally - managed resources.
+        /// </summary>
+        /// <param name="dispose"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
+        protected virtual void Dispose(bool dispose)
+        {
+            if (dispose)
+            {
+                foreach (var key in _openStreams.Keys.ToList())
+                {
+                    CloseLiveStream(key).GetAwaiter().GetResult();
+                }
+
+                _liveStreamLocker.Dispose();
+            }
         }
     }
 }
