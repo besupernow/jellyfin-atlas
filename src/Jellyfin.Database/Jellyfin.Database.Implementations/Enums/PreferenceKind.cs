@@ -68,5 +68,11 @@ public enum PreferenceKind
     /// <summary>
     /// A list of allowed tags.
     /// </summary>
-    AllowedTags = 12
+    AllowedTags = 12,
+
+    /// <summary>
+    /// Atlas: the user's ListenBrainz username, which Atlas music mode reads its recommendations from.
+    /// Kept far from upstream's numbering so a new upstream kind never lands on it.
+    /// </summary>
+    AtlasListenBrainzUserName = 1000
 }
