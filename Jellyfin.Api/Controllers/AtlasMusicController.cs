@@ -81,7 +81,7 @@ public class AtlasMusicController : BaseJellyfinApiController
                 ListenBrainzUserName = ListenBrainzUserName(user)
             })
             .ToList();
-        return Ok(users);
+        return Ok<AtlasMusicUserDto>(users);
     }
 
     /// <summary>
